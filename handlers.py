@@ -3,6 +3,7 @@ import html
 import os
 import re
 import sys
+import time
 
 from pyrogram import StopPropagation, filters
 from pyrogram.enums import ChatType
@@ -13,9 +14,9 @@ from pyrogram.types import InlineKeyboardMarkup as Markup
 import config
 import rclone
 from client import app
-from jobs import JOBS, NO_CONF, Job, run_job
+from jobs import JOBS, NO_CONF, Job, job_kb, run_job
 from store import db
-from utils import human_time, sysline
+from utils import human_time, stats, sysline
 
 TASKS = set()
 
@@ -34,37 +35,37 @@ OPTIONS = {
 
 START_TEXT = (
     "👋 <b>Encode Bot</b>\n\n"
-    "GDrive folder/file ba direct download link theke video download kore encode kore "
-    "GDrive ba Telegram e upload kori.\n\n"
-    "/settings - encode settings, GDrive connect\n"
-    "/help - shob command"
+    "I download videos from a GDrive folder/file or a direct link, encode them, "
+    "and upload the result to GDrive or Telegram.\n\n"
+    "/settings - encode settings and GDrive connect\n"
+    "/help - all commands"
 )
 
 HELP_TEXT = (
     "<b>Commands</b>\n\n"
-    "/genc <code>link</code> - encode kore GDrive e upload\n"
-    "/tenc <code>link</code> - encode kore Telegram e upload\n"
-    "<code>link</code> = GDrive folder/file link ba direct download link\n"
-    "<code>-n NewName.mkv</code> - output file er naam (single file e)\n"
+    "/genc <code>link</code> - encode and upload to GDrive\n"
+    "/tenc <code>link</code> - encode and upload to Telegram\n"
+    "<code>link</code> = GDrive folder/file link or a direct download link\n"
+    "<code>-n NewName.mkv</code> - output file name (single file only)\n"
     "Example: <code>/tenc https://site.com/ep1.mkv -n ANIME.mkv</code>\n\n"
     "/settings - encode settings, quality name swap, send as media/document, GDrive\n"
-    "/rclone - rclone.conf save (private chat e file pathiye caption e /rclone)\n"
+    "/rclone - save your rclone.conf (send the file in a private chat with /rclone as caption)\n"
     "/status - running jobs\n"
-    "/cancel <code>id</code> - job cancel\n"
+    "/cancel <code>id</code> - cancel a job\n"
 )
 
-USAGE = ("Link dao.\n<code>/genc link</code>\n<code>/tenc link</code>\n"
+USAGE = ("Please send a link.\n<code>/genc link</code>\n<code>/tenc link</code>\n"
          "<code>/tenc direct_link -n ANIME.mkv</code>")
 
 GD_HELP = (
     "🔗 <b>GDrive Connect (rclone)</b>\n\n"
-    "1. PC ba Termux e rclone install koro (<code>pkg install rclone</code> ba rclone.org).\n"
-    "2. <code>rclone config</code> → New remote → type <b>drive</b> → scope <b>1</b> (full access) "
-    "→ browser e login kore Gmail select koro.\n"
-    "3. <code>rclone config file</code> dile config er path dekhabe. Oi <b>rclone.conf</b> file ta "
-    "ei bot er <b>private chat e</b> pathao, caption e <code>/rclone</code> likho.\n"
-    "4. Connect hole <code>/genc folder_link</code> ba <code>/tenc folder_link</code> use koro.\n\n"
-    "⚠️ Group e config pathaio na, ota tomar GDrive er password er moto."
+    "1. Install rclone on a PC or in Termux (<code>pkg install rclone</code>, or rclone.org).\n"
+    "2. Run <code>rclone config</code> → New remote → type <b>drive</b> → scope <b>1</b> (full access) "
+    "→ log in with the browser and pick your Gmail account.\n"
+    "3. Run <code>rclone config file</code> to see where the config is stored. Send that "
+    "<b>rclone.conf</b> file to this bot in a <b>private chat</b> with <code>/rclone</code> as the caption.\n"
+    "4. Once connected, use <code>/genc folder_link</code> or <code>/tenc folder_link</code>.\n\n"
+    "⚠️ Never send the config in a group. It works like a password for your GDrive."
 )
 
 
@@ -78,7 +79,7 @@ async def gate_msg(client, m):
         return
     if rec["status"] == "banned":
         if m.chat.type == ChatType.PRIVATE:
-            await m.reply_text("🚫 Tumi ei bot e banned.")
+            await m.reply_text("🚫 You are banned from using this bot.")
         raise StopPropagation
     if rec["status"] == "muted":
         raise StopPropagation
@@ -90,7 +91,7 @@ async def gate_cb(client, cq):
     if cq.from_user.id == config.OWNER_ID:
         return
     if rec["status"] in ("banned", "muted"):
-        await cq.answer("Access nei.", show_alert=True)
+        await cq.answer("No access.", show_alert=True)
         raise StopPropagation
 
 
@@ -162,14 +163,22 @@ async def status_cmd(client, m):
     admin = db.is_admin(uid)
     jobs = [j for j in JOBS.values() if admin or j.user_id == uid]
     if not jobs:
-        return await m.reply_text("Kono active job nei.\n\n<code>" + sysline() + "</code>")
+        return await m.reply_text("No active jobs.\n\n<code>" + sysline() + "</code>")
     lines = []
     for j in jobs:
         pct = (j.done / j.total * 100) if j.total else 0
         lines.append(f"• <code>{j.id}</code> #{j.kind} {j.stage} {pct:.0f}% "
-                     f"[{j.file_idx}/{j.file_total or '-'}] {human_time(__import__('time').time() - j.started)}")
+                     f"[{j.file_idx}/{j.file_total or '-'}] {human_time(time.time() - j.started)}")
     await m.reply_text("<b>Active jobs</b>\n" + "\n".join(lines) +
                        "\n\n<code>" + sysline() + "</code>")
+
+
+async def _cancel(m, job):
+    admin = db.is_admin(m.from_user.id)
+    if not job or not (admin or job.user_id == m.from_user.id):
+        return await m.reply_text("Job not found.")
+    job.cancel()
+    await m.reply_text(f"Cancelling <code>{job.id}</code>...")
 
 
 @app.on_message(filters.command("cancel"))
@@ -184,22 +193,48 @@ async def cancel_cmd(client, m):
     elif len(mine) == 1:
         job = mine[0]
     else:
-        return await m.reply_text("Job id dao: <code>/cancel id</code> (/status e id pabe).")
-    if not job or not (admin or job.user_id == uid):
-        return await m.reply_text("Job paoa jayni.")
-    job.cancel()
-    await m.reply_text(f"Cancelling <code>{job.id}</code>...")
+        return await m.reply_text("Please provide a job id: <code>/cancel id</code> (see /status).")
+    await _cancel(m, job)
+
+
+@app.on_message(filters.regex(r"^/cancel_([0-9a-f]{8})"))
+async def cancel_link_cmd(client, m):
+    if m.from_user:
+        await _cancel(m, JOBS.get(m.matches[0].group(1)))
 
 
 @app.on_callback_query(filters.regex(r"^jc\|"))
 async def cancel_cb(client, cq):
     job = JOBS.get(cq.data.split("|")[1])
     if not job:
-        return await cq.answer("Job shesh ba nei.", show_alert=True)
+        return await cq.answer("This job has already finished.", show_alert=True)
     if not (db.is_admin(cq.from_user.id) or job.user_id == cq.from_user.id):
-        return await cq.answer("Eta tomar job na.", show_alert=True)
+        return await cq.answer("This is not your job.", show_alert=True)
     job.cancel()
     await cq.answer("Cancelling...")
+
+
+@app.on_callback_query(filters.regex(r"^jr\|"))
+async def refresh_cb(client, cq):
+    job = JOBS.get(cq.data.split("|")[1])
+    if not job:
+        return await cq.answer("This job has already finished.", show_alert=True)
+    try:
+        await cq.message.edit_text(job.render(), reply_markup=job_kb(job.id))
+    except MessageNotModified:
+        pass
+    await cq.answer("Refreshed")
+
+
+@app.on_callback_query(filters.regex(r"^jt\|"))
+async def stats_cb(client, cq):
+    st = stats()
+    await cq.answer(
+        f"CPU: {st['cpu']:.1f}%\nRAM: {st['ram']:.1f}%\n"
+        f"Free disk: {st['free']} [{st['free_pct']:.1f}%]\nUptime: {st['up']}\n"
+        f"Running jobs: {len(JOBS)}",
+        show_alert=True,
+    )
 
 
 # ------------------------------------------------------------------ rclone.conf
@@ -212,12 +247,12 @@ async def rclone_cmd(client, m):
     if not m.from_user:
         return
     if m.chat.type != ChatType.PRIVATE:
-        return await m.reply_text("⚠️ /rclone sudhu private chat e use koro.")
+        return await m.reply_text("⚠️ Use /rclone in a private chat only.")
     doc = m.document or (m.reply_to_message.document if m.reply_to_message else None)
     if not doc:
         return await m.reply_text(GD_HELP)
     if doc.file_size and doc.file_size > 200 * 1024:
-        return await m.reply_text("File ta boro, eta rclone.conf na mone hocche.")
+        return await m.reply_text("This file is too large to be an rclone.conf.")
     os.makedirs(config.WORK_DIR, exist_ok=True)
     tmp = os.path.join(config.WORK_DIR, f"rc_{m.from_user.id}.conf")
     path = await client.download_media(doc, file_name=tmp)
@@ -227,13 +262,13 @@ async def rclone_cmd(client, m):
     uid = m.from_user.id
     remote = rclone.save_conf(uid, data)
     if not remote:
-        return await m.reply_text("❌ Config e kono <b>drive</b> remote paini.")
+        return await m.reply_text("❌ No <b>drive</b> remote found in this config.")
     ok, err = await rclone.verify(uid, remote)
     if not ok:
         rclone.remove_conf(uid)
-        return await m.reply_text(f"❌ GDrive connect hoyni:\n<code>{html.escape(err)}</code>")
+        return await m.reply_text(f"❌ Could not connect to GDrive:\n<code>{html.escape(err)}</code>")
     try:
-        await m.delete()  # token thaka file chat theke muche felo
+        await m.delete()  # remove the file (it contains tokens) from the chat
     except Exception:
         pass
     await client.send_message(m.chat.id, f"✅ GDrive connected (remote: <code>{html.escape(remote)}</code>)")
@@ -333,7 +368,7 @@ async def settings_cb(client, cq):
     p = cq.data.split("|")
     uid = int(p[1])
     if cq.from_user.id != uid:
-        return await cq.answer("Eta tomar settings na. /settings dao.", show_alert=True)
+        return await cq.answer("These are not your settings. Send /settings.", show_alert=True)
     act = p[2]
 
     if act == "close":

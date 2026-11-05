@@ -4,7 +4,7 @@ import os
 import re
 
 import config
-from utils import Cancelled, UserError, run_proc
+from utils import Cancelled, UserError, cpu_limit, run_proc
 
 EXTS = {"mkv", "mp4", "avi", "webm", "ts", "mov"}
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".webm", ".ts", ".mov", ".m4v", ".flv", ".wmv", ".mpg", ".mpeg"}
@@ -50,10 +50,16 @@ def quality_label(settings, src_height):
 def output_name(src_name, label, swap, ext, custom=None):
     """Returns (final file name, container extension)."""
     if custom:
-        e = os.path.splitext(custom)[1].lstrip(".").lower()
-        if e in EXTS:
-            return custom, e
-        return f"{custom}.{ext}", ext
+        cext = os.path.splitext(custom)[1].lstrip(".").lower()
+        if cext in EXTS:
+            root, dot_ext = os.path.splitext(custom)
+            out_ext = cext
+        else:
+            root, dot_ext = custom, f".{ext}"
+            out_ext = ext
+        if swap and QUAL_RE.search(root):
+            root = QUAL_RE.sub(label, root, count=1)
+        return root + dot_ext, out_ext
     stem = os.path.splitext(src_name)[0]
     if swap:
         if QUAL_RE.search(stem):
@@ -67,8 +73,10 @@ def output_name(src_name, label, swap, ext, custom=None):
 
 def build_cmd(src, dst, s, ext, with_subs):
     v, a = s["vcodec"], s["acodec"]
+    threads = str(max(1, min(cpu_limit(), 16)))
     cmd = ["ffmpeg", "-y", "-hide_banner", "-nostats", "-loglevel", "error",
-           "-progress", "pipe:1", "-i", src, "-map", "0:v:0", "-map", "0:a?"]
+           "-progress", "pipe:1", "-threads", threads, "-i", src,
+           "-threads", threads, "-map", "0:v:0", "-map", "0:a?"]
     if with_subs and ext == "mkv":
         cmd += ["-map", "0:s?", "-map", "0:t?", "-c:s", "copy", "-c:t", "copy"]
     elif with_subs and ext in ("mp4", "mov"):

@@ -1,28 +1,29 @@
 # Encode Bot (GDrive / Telegram)
 
-GDrive folder ba direct link theke video download -> ffmpeg encode -> GDrive (`/genc`) ba Telegram (`/tenc`) e upload.
+Downloads videos from a GDrive folder/file or a direct link, encodes them with ffmpeg, and uploads
+the result to GDrive (`/genc`) or Telegram (`/tenc`).
 
-## Railway Variables
-| Variable | Kothay pabe |
+## Railway variables
+| Variable | Where to get it |
 |---|---|
 | `API_ID`, `API_HASH` | my.telegram.org -> API development tools |
 | `BOT_TOKEN` | @BotFather |
-| `OWNER_ID` | tomar Telegram id (@userinfobot) |
-| `TAG_NAME` (optional) | folder naam er tag, default `Blaze Ash` |
-| `MAX_CONCURRENT` (optional) | ek shathe koyta job, default 1 |
+| `OWNER_ID` | your Telegram user id (@userinfobot) |
+| `TAG_NAME` (optional) | tag used in output folder names, default `Blaze Ash` |
+| `MAX_CONCURRENT` (optional) | number of jobs at the same time, default 1 |
 | `AUDIO_BITRATE` (optional) | default `128k` |
 
 ## Volume
-Railway -> service -> Settings -> Volumes -> New Volume -> Mount Path `/data`.
-Settings, users list, rclone.conf shob `/data` e thake, restart e haray na.
+Railway -> service -> Settings -> Volumes -> New Volume -> mount path `/data`.
+Settings, the users list and rclone.conf files are stored in `/data` and survive restarts.
 
 ## Commands
-- `/genc link` - encode + GDrive upload (notun folder: `{res} {source folder} [TAG]`)
-- `/tenc link` - encode + Telegram upload
-- `link` = GDrive folder/file link ba direct download link; `-n Name.mkv` diye naam dite paro
-- `/settings` - Encode settings, QUALITY NAME SWAP, Send as Media/Document, Auto Delete, GDrive
-- `/rclone` - private chat e rclone.conf pathao (caption `/rclone`)
-- `/status`, `/cancel id`
-- Owner: `/panel`, `/restart`
+- `/genc link` - encode and upload to GDrive (new folder: `{res} {source folder} [TAG]`)
+- `/tenc link` - encode and upload to Telegram
+- `link` = GDrive folder/file link or a direct download link; add `-n Name.mkv` to set the output name
+- `/settings` - encode settings, quality name swap, send as media/document, auto delete, GDrive connect
+- `/rclone` - send your rclone.conf in a private chat with `/rclone` as the caption
+- `/status`, `/cancel id` (or tap the `/cancel_<id>` link in the status message)
+- Owner only: `/panel`, `/restart`
 
-Commands bot nijei startup e set kore nay (BotFather e kichu korte hobe na).
+The bot registers its own command menu on startup, nothing to set in BotFather.

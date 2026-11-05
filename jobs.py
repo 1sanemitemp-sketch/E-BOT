@@ -14,19 +14,23 @@ import ddl
 import encoder
 import rclone
 from store import db
-from utils import (Cancelled, UserError, bar, human_size, human_time, natural_key,
-                   safe_name, sysline)
+from utils import (Cancelled, UserError, bar, bot_stats_text, human_size, human_time,
+                   natural_key, safe_name)
 
 log = logging.getLogger("jobs")
 JOBS = {}
 SEM = asyncio.Semaphore(config.MAX_CONCURRENT)
 
-NO_CONF = ("GDrive connect kora nai. /settings e GDrive Connect dekho, "
-           "ba private chat e rclone.conf pathiye caption e /rclone likho.")
+NO_CONF = ("GDrive is not connected. Open /settings and tap GDrive Connect, "
+           "or send your rclone.conf in a private chat with /rclone as the caption.")
 
 
-def cancel_kb(job_id):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"jc|{job_id}")]])
+def job_kb(job_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Stats", callback_data=f"jt|{job_id}"),
+         InlineKeyboardButton("♻️ Refresh", callback_data=f"jr|{job_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"jc|{job_id}")],
+    ])
 
 
 class Job:
@@ -54,6 +58,8 @@ class Job:
         self.file_idx = 0
         self.file_total = 0
         self.started = time.time()
+        self.stage_started = time.time()
+        self.src_gd = bool(rclone.gdrive_id(link))
 
         self.cancelled = False
         self.proc = None
@@ -70,6 +76,7 @@ class Job:
         self.speed = 0.0
         self._lt = 0.0
         self._ld = 0
+        self.stage_started = time.time()
 
     def set_progress(self, done, total=0):
         now = time.monotonic()
@@ -99,31 +106,40 @@ class Job:
     def render(self):
         pct = min(100.0, (self.done / self.total * 100) if self.total else 0.0)
         if self.unit == "time":
-            proc, tot = human_time(self.done), human_time(self.total)
+            proc = f"{human_time(self.done)} of {human_time(self.total)}"
             spd = f"{self.speed:.2f}x"
         else:
-            proc, tot = human_size(self.done), human_size(self.total)
+            proc = f"{human_size(self.done)} of {human_size(self.total)}"
             spd = f"{human_size(self.speed)}/s"
-        eta = human_time((self.total - self.done) / self.speed) if self.speed > 0 and self.total else "-"
-        icon = {"queued": "⏳", "resolving": "🔎", "downloading": "📥",
-                "encoding": "🎞", "uploading": "📤"}.get(self.stage, "⚙️")
+        elapsed = time.time() - self.stage_started
+        if self.speed > 0 and self.total:
+            eta = max(0.0, (self.total - self.done) / self.speed)
+            time_line = f"{human_time(elapsed)} of {human_time(elapsed + eta)} ( {human_time(eta)} )"
+        else:
+            time_line = human_time(elapsed)
+        status = {"queued": "Queued", "resolving": "Resolving", "downloading": "Download",
+                  "encoding": "Encode", "uploading": "Upload"}.get(self.stage, self.stage)
+        in_mode = "#GDrive" if self.src_gd else "#DDL"
+        if self.kind == "genc":
+            out_mode = "#GDrive"
+        else:
+            out_mode = "#Telegram (Document)" if self.settings["as_doc"] else "#Telegram (Media)"
         files = f"{self.file_idx}/{self.file_total}" if self.file_total else "-"
+        index = f"{self.file_idx}. " if self.file_idx else ""
         return (
-            f"{icon} <b>{self.stage.capitalize()}...</b>\n"
-            f"<code>{html.escape(self.file_name[:80])}</code>\n\n"
-            f"┌ [{bar(pct)}]\n"
-            f"├ <b>Progress:</b> {pct:.2f}%\n"
-            f"├ <b>Processed:</b> {proc}\n"
-            f"├ <b>Total:</b> {tot}\n"
-            f"├ <b>Speed:</b> {spd}\n"
-            f"├ <b>ETA:</b> {eta}\n"
-            f"├ <b>Elapsed:</b> {human_time(time.time() - self.started)}\n"
-            f"├ <b>File:</b> {files}\n"
-            f"├ <b>Engine:</b> {self.engine}\n"
-            f"├ <b>By:</b> {self.mention}\n"
-            f"├ <b>Action:</b> #{self.kind}\n"
-            f"└ /cancel <code>{self.id}</code>\n\n"
-            f"<code>{sysline()}</code>"
+            f"<b>{index}{html.escape(self.file_name[:90]) or 'Preparing...'}</b>\n\n"
+            f"Task By {self.mention} ( <code>#ID{self.user_id}</code> )\n"
+            f"┌ [{bar(pct)}] {pct:.2f}%\n"
+            f"├ <b>Processed</b> → {proc}\n"
+            f"├ <b>Status</b> → {status}\n"
+            f"├ <b>Speed</b> → {spd}\n"
+            f"├ <b>Time</b> → {time_line}\n"
+            f"├ <b>Engine</b> → {self.engine}\n"
+            f"├ <b>File</b> → {files}\n"
+            f"├ <b>In Mode</b> → {in_mode}\n"
+            f"├ <b>Out Mode</b> → {out_mode}\n"
+            f"└ <b>Stop</b> → /cancel_{self.id}\n\n"
+            f"⌬ <b>Bot Stats</b>\n{bot_stats_text()}"
         )
 
     def summary(self):
@@ -146,7 +162,7 @@ async def status_loop(client, job):
             continue
         try:
             await client.edit_message_text(job.chat_id, job.msg.id, text,
-                                           reply_markup=cancel_kb(job.id))
+                                           reply_markup=job_kb(job.id))
         except MessageNotModified:
             pass
         except FloodWait as e:
@@ -166,7 +182,7 @@ async def resolve_source(job):
             raise UserError(NO_CONF)
         remote = rclone.first_drive_remote(rclone.conf_path(uid))
         if not remote:
-            raise UserError("rclone.conf e kono drive remote paini.")
+            raise UserError("No drive remote found in your rclone.conf.")
 
     ctx = {"remote": remote, "root_id": fid, "parent_id": None, "folder_name": None, "items": []}
 
@@ -198,16 +214,16 @@ async def resolve_source(job):
             ctx["items"] = [{"name": f["Name"], "size": f.get("Size", 0), "path": f["Path"]}
                             for f in files]
             if not ctx["items"]:
-                raise UserError("Folder e kono video file paini.")
+                raise UserError("No video files found in this folder.")
         else:
             if not meta:
-                raise UserError("File access kora jachche na. Link ba permission check koro.")
+                raise UserError("Cannot access this file. Check the link and its permissions.")
             ctx["folder_name"] = None
             ctx["items"] = [{"name": meta["name"], "size": int(meta.get("size") or 0), "gid": fid}]
     elif job.link.lower().startswith(("http://", "https://")):
         ctx["items"] = [{"url": job.link}]
     else:
-        raise UserError("Valid GDrive link ba direct download link dao.")
+        raise UserError("Please send a valid GDrive link or a direct download link.")
     return ctx
 
 
@@ -215,8 +231,8 @@ async def resolve_source(job):
 async def send_telegram(client, job, path, name, thumb, info):
     size = os.path.getsize(path)
     if size > config.TG_LIMIT:
-        raise UserError("File 2GB er beshi, Telegram bot upload korte parbe na. "
-                        "/genc diye GDrive e upload koro.")
+        raise UserError("The file is larger than 2GB, so a bot cannot upload it to Telegram. "
+                        "Use /genc to upload it to GDrive instead.")
     job.set_stage("uploading", "Pyrogram")
     job.total = size
 
@@ -225,7 +241,7 @@ async def send_telegram(client, job, path, name, thumb, info):
             client.stop_transmission()
         job.set_progress(cur, tot)
 
-    cap = f"<code>{html.escape(name)}</code>"
+    cap = f"<b>{html.escape(name)}</b>"
     if job.settings["as_doc"]:
         await client.send_document(job.chat_id, path, thumb=thumb, caption=cap, progress=prog)
     else:
@@ -259,14 +275,14 @@ async def process_item(client, job, ctx, item, single):
         else:
             await rclone.download_id(job, ctx["remote"], item["gid"], src, job.total)
     if not os.path.exists(src):
-        raise UserError("Download hoyni.")
+        raise UserError("Download failed.")
     src_name = os.path.basename(src)
-    job.file_name = src_name
+    job.file_name = job.custom_name if (single and job.custom_name) else src_name
 
     # 2. probe + naming
     info = await encoder.probe(src)
     if not info or info["duration"] <= 0:
-        raise UserError("Video file invalid ba corrupt.")
+        raise UserError("The video file is invalid or corrupt.")
     label = encoder.quality_label(s, info["height"])
     out_name, ext = encoder.output_name(src_name, label, s["swap"], s["ext"],
                                         job.custom_name if single else None)
@@ -332,7 +348,7 @@ async def pipeline(client, job):
 
 
 async def run_job(client, job):
-    job.msg = await client.send_message(job.chat_id, job.render(), reply_markup=cancel_kb(job.id))
+    job.msg = await client.send_message(job.chat_id, job.render(), reply_markup=job_kb(job.id))
     updater = asyncio.create_task(status_loop(client, job))
     final = "❌ <b>Stopped.</b>"
     try:

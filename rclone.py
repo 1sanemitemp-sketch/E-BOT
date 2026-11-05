@@ -129,6 +129,27 @@ async def list_folder(uid, remote, fid):
     return [d for d in json.loads(out or "[]") if not d.get("IsDir")]
 
 
+STATS_FLAGS = ["--stats", "2s", "--use-json-log", "--stats-log-level", "NOTICE"]
+
+
+def _make_cb(job):
+    errs = []
+
+    def cb(line):
+        try:
+            o = json.loads(line)
+        except Exception:
+            errs.append(line[-200:])
+            return
+        st = o.get("stats")
+        if st:
+            job.set_progress(st.get("bytes", 0), st.get("totalBytes") or job.total)
+        elif o.get("level") in ("error", "critical"):
+            errs.append(str(o.get("msg"))[-200:])
+
+    return cb, errs
+
+
 async def _watch_dir(path, total, job):
     while True:
         await asyncio.sleep(2)
@@ -142,56 +163,40 @@ async def _watch_dir(path, total, job):
         job.set_progress(size, total)
 
 
-async def _run_download(job, args, dst, total):
-    watcher = asyncio.create_task(_watch_dir(os.path.dirname(dst), total, job))
+async def _run(job, args, on_err=None, errs=None, watch=None):
+    watcher = asyncio.create_task(_watch_dir(*watch)) if watch else None
     try:
-        rc, err = await run_proc(_argv(job.user_id, args), job)
+        rc, tail = await run_proc(_argv(job.user_id, args), job, on_stderr=on_err)
     finally:
-        watcher.cancel()
+        if watcher:
+            watcher.cancel()
     if job.cancelled:
         raise Cancelled()
     if rc != 0:
-        raise RcloneError(err[-300:] or "download failed")
+        raise RcloneError((errs[-1] if errs else tail[-300:]) or "rclone failed")
 
 
 async def download_path(job, remote, root_id, rel_path, dst, total):
-    await _run_download(
-        job,
-        ["copyto", f"{remote}:{rel_path}", dst, "--drive-root-folder-id", root_id,
-         "--drive-acknowledge-abuse"],
-        dst, total,
-    )
+    cb, errs = _make_cb(job)
+    args = ["copyto", f"{remote}:{rel_path}", dst, "--drive-root-folder-id", root_id,
+            "--drive-acknowledge-abuse", "--multi-thread-streams", "8",
+            "--multi-thread-cutoff", "32M", *STATS_FLAGS]
+    await _run(job, args, on_err=cb, errs=errs)
 
 
 async def download_id(job, remote, gid, dst, total):
-    await _run_download(
-        job, ["backend", "copyid", f"{remote}:", gid, dst, "--drive-acknowledge-abuse"],
-        dst, total,
-    )
+    args = ["backend", "copyid", f"{remote}:", gid, dst, "--drive-acknowledge-abuse"]
+    await _run(job, args, watch=(os.path.dirname(dst), total, job))
 
 
 async def upload(job, remote, local, dest_dir, parent_id):
     name = os.path.basename(local)
-    args = ["copyto", local, f"{remote}:{dest_dir}/{name}",
-            "--stats", "2s", "--use-json-log", "--stats-log-level", "NOTICE",
-            "--drive-chunk-size", "32M"]
+    cb, errs = _make_cb(job)
+    args = ["copyto", local, f"{remote}:{dest_dir}/{name}", *STATS_FLAGS,
+            "--drive-chunk-size", "64M"]
     if parent_id:
         args += ["--drive-root-folder-id", parent_id]
-
-    def on_err(line):
-        try:
-            o = json.loads(line)
-        except Exception:
-            return
-        st = o.get("stats")
-        if st:
-            job.set_progress(st.get("bytes", 0), st.get("totalBytes") or job.total)
-
-    rc, err = await run_proc(_argv(job.user_id, args), job, on_stderr=on_err)
-    if job.cancelled:
-        raise Cancelled()
-    if rc != 0:
-        raise RcloneError(err[-300:] or "upload failed")
+    await _run(job, args, on_err=cb, errs=errs)
 
 
 async def delete_path(uid, remote, root_id, rel_path):

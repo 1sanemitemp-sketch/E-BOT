@@ -22,18 +22,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("main")
 
 USER_COMMANDS = [
-    BotCommand("start", "Bot start"),
-    BotCommand("help", "Shob command"),
-    BotCommand("settings", "Encode, GDrive, upload settings"),
-    BotCommand("genc", "Encode kore GDrive e upload"),
-    BotCommand("tenc", "Encode kore Telegram e upload"),
-    BotCommand("rclone", "rclone.conf save koro"),
+    BotCommand("start", "Start the bot"),
+    BotCommand("help", "All commands"),
+    BotCommand("settings", "Encode, GDrive and upload settings"),
+    BotCommand("genc", "Encode and upload to GDrive"),
+    BotCommand("tenc", "Encode and upload to Telegram"),
+    BotCommand("rclone", "Save your rclone.conf"),
     BotCommand("status", "Running jobs"),
-    BotCommand("cancel", "Job cancel"),
+    BotCommand("cancel", "Cancel a job"),
 ]
 OWNER_COMMANDS = USER_COMMANDS + [
     BotCommand("panel", "User control panel"),
-    BotCommand("restart", "Bot restart"),
+    BotCommand("restart", "Restart the bot"),
 ]
 
 
@@ -45,7 +45,7 @@ async def main():
     await app.set_bot_commands(USER_COMMANDS)
     try:
         await app.set_bot_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(chat_id=config.OWNER_ID))
-        await app.send_message(config.OWNER_ID, "✅ Bot started.")
+        await app.send_message(config.OWNER_ID, "✅ Start the boted.")
     except Exception as e:
         log.warning("Owner setup skipped (owner must /start the bot once): %s", e)
     log.info("Bot is running.")

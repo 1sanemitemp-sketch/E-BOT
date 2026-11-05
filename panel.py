@@ -58,7 +58,7 @@ def list_view(flt, page):
     page = max(0, min(page, pages - 1))
     text = f"👥 <b>{TITLES[flt]}</b> — {len(users)} user(s)"
     if not users:
-        text += "\n\nKono user nei."
+        text += "\n\nNo users."
     rows = [[Btn(_label(u), callback_data=f"pn|user|{u['id']}|{flt}|{page}")]
             for u in users[page * PER_PAGE:(page + 1) * PER_PAGE]]
     nav = []
@@ -75,7 +75,7 @@ def list_view(flt, page):
 def user_view(uid, flt="all", page=0):
     u = db.get_user(uid)
     if not u:
-        return "User paoa jayni.", Markup([[Btn("« Back", callback_data="pn|main")]])
+        return "User not found.", Markup([[Btn("« Back", callback_data="pn|main")]])
     status = {"active": "Active", "muted": "Muted 🔇", "banned": "Banned 🚫"}[u["status"]]
     text = (
         f"👤 <b>{html.escape(u['name'])}</b>\n"
