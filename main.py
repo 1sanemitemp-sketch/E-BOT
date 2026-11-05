@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import shutil
@@ -5,6 +6,10 @@ import shutil
 import config
 
 config.validate()
+
+# Create the event loop BEFORE importing the client so every Pyrogram version binds to it
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 from pyrogram import idle  # noqa: E402
 from pyrogram.types import BotCommand, BotCommandScopeChat  # noqa: E402
@@ -49,4 +54,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    app.run(main())
+    loop.run_until_complete(main())
