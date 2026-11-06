@@ -28,6 +28,7 @@ BOT_DEFAULTS = {
     "accept_tasks": True,
 }
 
+ENCODE_KEYS = ("vcodec", "acodec", "abitrate", "crf", "preset", "res", "fps", "ext")
 LIST_FILTERS = ("all", "active", "pending", "approved", "rejected", "muted", "banned", "admins")
 
 
@@ -184,6 +185,18 @@ class Store:
         s = dict(DEFAULTS)
         s.update(self.data["settings"].get(str(uid), {}))
         return s
+
+    def reset_settings(self, uid, keys=None):
+        """Reset the given setting keys to their defaults, or all of them when keys is None."""
+        cur = self.data["settings"].get(str(uid))
+        if cur is None:
+            return
+        if keys is None:
+            self.data["settings"].pop(str(uid), None)
+        else:
+            for k in keys:
+                cur.pop(k, None)
+        self.save()
 
     def set_setting(self, uid, key, value):
         self.data["settings"].setdefault(str(uid), {})[key] = value

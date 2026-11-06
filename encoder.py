@@ -129,6 +129,7 @@ async def encode(job, src, dst, s, ext, duration):
     last = ""
     for with_subs in attempts:
         cmd = build_cmd(src, dst, s, ext, with_subs)
+        job.external_speed = True
 
         def on_out(line):
             if line.startswith(("out_time_us=", "out_time_ms=")):
@@ -137,6 +138,11 @@ async def encode(job, src, dst, s, ext, duration):
                     secs = int(v) / 1_000_000
                     if secs >= 0:
                         job.set_progress(min(secs, duration), duration)
+            elif line.startswith("speed="):
+                try:
+                    job.speed = float(line.split("=", 1)[1].strip().rstrip("x"))
+                except ValueError:
+                    pass  # "N/A" at the very start
 
         rc, err = await run_proc(cmd, job, on_stdout=on_out)
         if job.cancelled:

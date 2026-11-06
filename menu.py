@@ -13,6 +13,8 @@ USER = [
     BotCommand("settings", "Encode, GDrive and upload settings"),
     BotCommand("genc", "Encode and upload to GDrive"),
     BotCommand("tenc", "Encode and upload to Telegram"),
+    BotCommand("gup", "Upload to GDrive without encoding"),
+    BotCommand("tup", "Upload to Telegram without encoding"),
     BotCommand("rclone", "Save your rclone.conf"),
     BotCommand("status", "Running jobs"),
     BotCommand("cancel", "Cancel a job"),
@@ -22,6 +24,7 @@ ADMIN_EXTRA = [
     BotCommand("ua", "Unauthorize a user: /ua user_id"),
     BotCommand("alist", "List authorized users"),
     BotCommand("ualist", "List unauthorized users"),
+    BotCommand("broadcast", "Message everyone who started the bot"),
 ]
 OWNER_EXTRA = [
     BotCommand("admin", "Make an admin: /admin user_id"),

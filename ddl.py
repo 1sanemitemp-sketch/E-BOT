@@ -124,7 +124,7 @@ async def download(url, dest_dir, job, local_name=None):
             name = safe_name(local_name)
         job.file_name = name if local_name else (job.custom_name or name)
         job.total = total
-        path = os.path.join(dest_dir, safe_name(save_as) if save_as else name)
+        path = os.path.join(dest_dir, name)
         if ranged and total >= PART_SIZE:
             await _parallel(s, url, path, total, job)
         else:

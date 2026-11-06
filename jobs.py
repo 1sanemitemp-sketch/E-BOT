@@ -50,8 +50,8 @@ class Limiter:
 
 LIMITER = Limiter(db.get_bot("max_concurrent"))
 
-NO_CONF = ("GDrive is not connected. Open /settings and tap GDrive Connect, "
-           "or send your rclone.conf in a private chat with /rclone as the caption.")
+NO_CONF = ("GDrive is not connected. In a private chat send /rclone and then your rclone.conf file, "
+           "or open /settings and tap GDrive Connect.")
 
 
 def job_kb(job_id):
@@ -64,7 +64,7 @@ def job_kb(job_id):
 
 class Job:
     def __init__(self, kind, user, chat_id, link, custom_name, settings,
-                 thumb_url=None, extract=False, zip_out=False):
+                 thumb_url=None, extract=False, zip_out=False, plain=False):
         self.id = uuid.uuid4().hex[:8]
         self.kind = kind
         self.user_id = user.id
@@ -77,6 +77,7 @@ class Job:
         self.thumb_url = thumb_url
         self.extract = extract
         self.zip_out = zip_out
+        self.plain = plain  # upload without encoding (/gup, /tup)
         self.workdir = os.path.join(config.WORK_DIR, self.id)
 
         self.stage = "queued"
@@ -107,6 +108,10 @@ class Job:
         self.thumb = None
         self.zip_files = []
         self.pending_delete = []
+        self.used_names = set()
+        self.external_speed = False  # the speed comes from the tool (ffmpeg), not from our own samples
+        self.deleted_files = 0
+        self.deleted_folder = None
 
     # ---- state helpers ----
     def set_stage(self, stage, engine, unit="bytes"):
@@ -115,6 +120,7 @@ class Job:
         self.speed = 0.0
         self._lt = 0.0
         self._ld = 0
+        self.external_speed = False
         self.stage_started = time.time()
 
     def set_progress(self, done, total=0):
@@ -122,6 +128,8 @@ class Job:
         self.done = done
         if total:
             self.total = total
+        if self.external_speed:
+            return
         if self._lt == 0.0:
             self._lt, self._ld = now, done
             return
@@ -145,7 +153,7 @@ class Job:
     def header(self, title):
         return f"{title}\nTask By {self.mention} ( <code>#ID{self.user_id}</code> )"
 
-    def render_block(self):
+    def render_block(self, number=None):
         pct = min(100.0, (self.done / self.total * 100) if self.total else 0.0)
         if self.unit == "time":
             proc = f"{human_time(self.done)} of {human_time(self.total)}"
@@ -154,11 +162,11 @@ class Job:
             proc = f"{human_size(self.done)} of {human_size(self.total)}"
             spd = f"{human_size(self.speed)}/s"
         elapsed = time.time() - self.stage_started
-        if self.speed > 0 and self.total:
+        time_line = human_time(elapsed)
+        if self.speed >= 0.01 and self.total:
             eta = max(0.0, (self.total - self.done) / self.speed)
-            time_line = f"{human_time(elapsed)} of {human_time(elapsed + eta)} ( {human_time(eta)} )"
-        else:
-            time_line = human_time(elapsed)
+            if eta < 99 * 3600:  # an absurd ETA means the speed is not known yet
+                time_line = f"{human_time(elapsed)} of {human_time(elapsed + eta)} ( {human_time(eta)} )"
         status = {"queued": "Queued", "resolving": "Resolving", "downloading": "Download",
                   "extracting": "Extract", "encoding": "Encode", "zipping": "Zip", "splitting": "Split",
                   "uploading": "Upload"}.get(self.stage, self.stage)
@@ -168,7 +176,7 @@ class Job:
         else:
             out_mode = "#Telegram (Document)" if self.settings["as_doc"] else "#Telegram (Media)"
         files = f"{self.file_idx}/{self.file_total}" if self.file_total else "-"
-        index = f"{self.file_idx}. " if self.file_idx else ""
+        index = f"{number}. " if number else ""
         name = html.escape(self.file_name[:90]) or "Preparing..."
         return (
             f"<b>{index}{name}</b>\n\n"
@@ -186,16 +194,25 @@ class Job:
         )
 
     def render(self):
-        return f"{self.render_block()}\n\n⌬ <b>Bot Stats</b>\n{bot_stats_text()}"
+        number = list(JOBS).index(self.id) + 1 if self.id in JOBS else 1
+        return f"{self.render_block(number)}\n\n⌬ <b>Bot Stats</b>\n{bot_stats_text()}"
+
+    def result_markup(self):
+        """A button with the folder/file link, shown under the completion message."""
+        if not self.dest_link:
+            return None
+        label = "📁 Folder Link" if self.dest_is_dir else "📄 File Link"
+        return InlineKeyboardMarkup([[InlineKeyboardButton(label, url=self.dest_link)]])
 
     def summary(self):
         title = "✅ <b>Completed</b>" if not self.failed else "⚠️ <b>Completed with errors</b>"
         lines = [self.header(title), f"Files done: {self.ok}/{self.file_total}"]
         if self.kind == "genc" and self.dest:
             lines.append(f"GDrive folder: <code>{html.escape(self.dest)}</code>")
-        if self.dest_link:
-            label = "Folder link" if self.dest_is_dir else "File link"
-            lines.append(f'{label}: <a href="{self.dest_link}">Link</a>')
+        if self.deleted_folder:
+            lines.append(f"🗑 Source folder deleted: <code>{html.escape(self.deleted_folder)}</code>")
+        if self.deleted_files:
+            lines.append(f"🗑 Source files deleted: {self.deleted_files}")
         for n, e in self.failed[:10]:
             lines.append(f"• <code>{html.escape(n)}</code>: {html.escape(e)}")
         for note in self.notes:
@@ -261,13 +278,18 @@ async def resolve_source(job):
                 files = await rclone.list_folder(uid, remote, fid)
             except rclone.RcloneError as e:
                 raise UserError(f"Folder access error: {e}")
-            files = [f for f in files
-                     if os.path.splitext(f["Name"])[1].lower() in encoder.VIDEO_EXT]
+            if job.plain:
+                files = [f for f in files if not is_junk(f["Name"])]
+            else:
+                files = [f for f in files
+                         if os.path.splitext(f["Name"])[1].lower() in encoder.VIDEO_EXT]
             files.sort(key=lambda f: natural_key(f["Path"]))
             ctx["items"] = [{"name": f["Name"], "size": f.get("Size", 0), "path": f["Path"],
                              "id": f.get("ID")} for f in files]
             if not ctx["items"]:
-                raise UserError("No video files found in this folder.")
+                raise UserError("No files found in this folder." if job.plain
+                                else "No video files found in this folder.")
+            ctx["source_name"] = folder_name
             ctx["is_folder"] = True
             ctx["use_folder"] = True
             ctx["base_name"] = job.custom_name or folder_name
@@ -367,6 +389,31 @@ def zip_title(job, ctx):
                                          job.settings["tag"]))
 
 
+def unique_name(job, name, scope=""):
+    """Avoid two output files with the same name (archives often repeat names in sub folders)."""
+    base, ext = os.path.splitext(name)
+    candidate, n = name, 1
+    while f"{scope}/{candidate}".lower() in job.used_names:
+        n += 1
+        candidate = f"{base} ({n}){ext}"
+    job.used_names.add(f"{scope}/{candidate}".lower())
+    return candidate
+
+
+def is_junk(name):
+    return name.startswith(".") or name.lower() in ("thumbs.db", "desktop.ini")
+
+
+def find_files(root):
+    found = []
+    for base, _, files in os.walk(root):
+        if "__MACOSX" in base:
+            continue
+        found += [os.path.join(base, f) for f in files if not is_junk(f)]
+    found.sort(key=lambda p: natural_key(os.path.relpath(p, root)))
+    return found
+
+
 async def send_telegram(client, job, path, name, thumb, info, force_doc=False):
     size = os.path.getsize(path)
     if size > config.TG_LIMIT:
@@ -392,7 +439,7 @@ async def send_telegram(client, job, path, name, thumb, info, force_doc=False):
         raise Cancelled()
 
 
-async def deliver_file(client, job, ctx, path, thumb):
+async def deliver_file(client, job, ctx, path, thumb, rel_dir=""):
     """Upload a file as-is. Files above 2GB are split into numbered parts when needed."""
     size = os.path.getsize(path)
     split = size > config.TG_LIMIT and (job.kind == "tenc" or db.get_bot("split_gdrive"))
@@ -411,24 +458,47 @@ async def deliver_file(client, job, ctx, path, thumb):
         if job.kind == "genc":
             job.set_stage("uploading", "Rclone")
             job.total = os.path.getsize(part)
-            await rclone.upload(job, ctx["remote"], part, ctx.get("dest_dir"), ctx["parent_id"])
+            dest = "/".join(x for x in (ctx.get("dest_dir"), rel_dir) if x) or None
+            await rclone.upload(job, ctx["remote"], part, dest, ctx["parent_id"])
             ctx.setdefault("uploaded", []).append(name)
         else:
             await send_telegram(client, job, part, name, thumb, None, force_doc=True)
         os.remove(part)
 
 
-async def passthrough(client, job, ctx, src, out_dir, use_custom):
-    """An archive without -e is not encoded, it is uploaded as it is."""
+async def deliver_plain(client, job, ctx, path, rel_dir=""):
+    """Upload any file without encoding. Videos go to Telegram as media unless documents are chosen."""
+    size = os.path.getsize(path)
+    if (job.kind == "tenc" and not job.settings["as_doc"] and size <= config.TG_LIMIT
+            and os.path.splitext(path)[1].lower() in encoder.VIDEO_EXT):
+        info = await encoder.probe(path)
+        if info and info["duration"] > 0:
+            thumb = job.thumb or await encoder.thumbnail(path, path + ".jpg", info["duration"])
+            await send_telegram(client, job, path, os.path.basename(path), thumb, info)
+            os.remove(path)
+            return
+    await deliver_file(client, job, ctx, path, job.thumb, rel_dir)
+
+
+async def passthrough(client, job, ctx, src, out_dir, use_custom, rel_dir=""):
+    """Upload a file as it is (plain mode, or an archive without -e). Nothing is encoded."""
     name = os.path.basename(src)
     if use_custom and job.custom_name:
         ext = os.path.splitext(name)[1]
         name = job.custom_name if os.path.splitext(job.custom_name)[1] else job.custom_name + ext
-    name = safe_name(name)
+    name = unique_name(job, safe_name(name), rel_dir if job.kind == "genc" else "")
+    ensure_dest(job, ctx, "", name)
+    if job.zip_out and not is_archive(src):  # -z: collect the file for the zip
+        keep = os.path.join(job.workdir, "zipout", str(len(job.zip_files)))
+        os.makedirs(keep, exist_ok=True)
+        dst = os.path.join(keep, name)
+        shutil.move(src, dst)
+        job.zip_files.append((dst, "/".join(x for x in (rel_dir, name) if x)))
+        return
     dst = os.path.join(out_dir, name)
     os.replace(src, dst)
     job.file_name = name
-    await deliver_file(client, job, ctx, dst, job.thumb)
+    await deliver_plain(client, job, ctx, dst, rel_dir)
 
 
 async def encode_one(client, job, ctx, src, out_dir, use_custom):
@@ -441,7 +511,7 @@ async def encode_one(client, job, ctx, src, out_dir, use_custom):
     label = encoder.quality_label(s, info["height"])
     out_name, ext = encoder.output_name(src_name, label, s["swap"], s["ext"],
                                         job.custom_name if use_custom else None)
-    out_name = safe_name(out_name)
+    out_name = unique_name(job, safe_name(out_name))
     out_path = os.path.join(out_dir, out_name)
     job.file_name = out_name
 
@@ -505,8 +575,18 @@ async def delete_sources(job, ctx, items):
     for item in items:
         if not item.get("id") or not ctx.get("remote"):
             continue
-        if not await rclone.delete_id(job.user_id, ctx["remote"], item["id"]):
+        if await rclone.delete_id(job.user_id, ctx["remote"], item["id"]):
+            job.deleted_files += 1
+        else:
             job.notes.append(f"Could not delete the source: {item.get('name', item['id'])}")
+
+
+async def handle_local(client, job, ctx, src, out_dir, use_custom, rel_dir=""):
+    """Encode one downloaded file, or upload it as it is (plain mode, or an archive)."""
+    if job.plain or is_archive(src):
+        await passthrough(client, job, ctx, src, out_dir, use_custom, rel_dir)
+    else:
+        await encode_one(client, job, ctx, src, out_dir, use_custom)
 
 
 # ---------------------------------------------------------------- pipelines
@@ -519,11 +599,8 @@ async def process_item(client, job, ctx, item, single):
     use_custom = single and not job.zip_out
     src = await download_item(job, ctx, item, src_dir)
     job.file_name = job.custom_name if (use_custom and job.custom_name) else os.path.basename(src)
-    if not job.extract and is_archive(src):
-        job.zip_out = False  # nothing to zip: the archive itself is uploaded
-        await passthrough(client, job, ctx, src, out_dir, single)
-    else:
-        await encode_one(client, job, ctx, src, out_dir, use_custom)
+    rel_dir = os.path.dirname(item["path"]) if (job.plain and item.get("path")) else ""
+    await handle_local(client, job, ctx, src, out_dir, use_custom, rel_dir)
     shutil.rmtree(out_dir, ignore_errors=True)
     if job.settings.get("auto_delete"):
         if job.zip_out:
@@ -542,29 +619,39 @@ async def run_extract(client, job, ctx):
     job.file_total, job.file_idx = 1, 1
     archive = await download_item(job, ctx, item, src_dir, save_as=job.custom_name)
     job.file_name = os.path.basename(archive)
+
+    if not is_archive(archive):
+        # -e on a file that is not an archive: handle it like a normal single file
+        await handle_local(client, job, ctx, archive, out_dir, not job.zip_out)
+        job.ok += 1
+        if job.settings.get("auto_delete"):
+            job.pending_delete.append(item)
+        return
+
     await extract_archive(job, archive, ex_dir)
     os.remove(archive)
-
-    videos = find_videos(ex_dir)
-    if not videos:
-        raise UserError("No video files were found inside the archive.")
+    files = find_files(ex_dir) if job.plain else find_videos(ex_dir)
+    if not files:
+        raise UserError("No files were found inside the archive." if job.plain
+                        else "No video files were found inside the archive.")
     ctx["base_name"] = os.path.splitext(os.path.basename(archive))[0]
-    ctx["use_folder"] = len(videos) > 1 and not job.zip_out
-    job.file_total = len(videos)
-    for i, video in enumerate(videos, 1):
+    ctx["use_folder"] = len(files) > 1 and not job.zip_out
+    job.file_total = len(files)
+    for i, path in enumerate(files, 1):
         if job.cancelled:
             raise Cancelled()
         job.file_idx = i
-        job.file_name = os.path.basename(video)
+        job.file_name = os.path.basename(path)
         shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir)
+        rel_dir = os.path.dirname(os.path.relpath(path, ex_dir)) if job.plain else ""
         try:
-            await encode_one(client, job, ctx, video, out_dir, False)
+            await handle_local(client, job, ctx, path, out_dir, False, rel_dir)
             job.ok += 1
         except Cancelled:
             raise
         except Exception as e:
-            if len(videos) == 1:
+            if len(files) == 1:
                 raise
             log.warning("item failed: %s", job.file_name, exc_info=True)
             job.failed.append((job.file_name, str(e)[:200]))
@@ -605,10 +692,17 @@ async def pipeline(client, job):
                 log.warning("item failed: %s", job.file_name, exc_info=True)
                 job.failed.append((job.file_name, str(e)[:200]))
 
-    if job.zip_out:
+    if job.zip_out and job.zip_files:
         await finalize_zip(client, job, ctx)
     if job.pending_delete:
         await delete_sources(job, ctx, job.pending_delete)
+    if (job.settings.get("auto_delete") and ctx.get("is_folder") and not job.failed
+            and job.ok == len(items)):
+        # every file of the source folder was handled, so the folder itself is removed too
+        if await rclone.delete_id(job.user_id, ctx["remote"], ctx["root_id"]):
+            job.deleted_folder = ctx.get("source_name") or "Folder"
+        else:
+            job.notes.append("Could not delete the source folder.")
     if job.kind == "genc":
         target = ctx.get("dest_dir")
         if not target:
@@ -626,7 +720,7 @@ async def _finish(client, job, final):
     except Exception:
         pass
     try:
-        await client.send_message(job.chat_id, final)
+        await client.send_message(job.chat_id, final, reply_markup=job.result_markup())
     except Exception:
         log.warning("could not send the final message", exc_info=True)
 

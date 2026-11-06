@@ -17,7 +17,7 @@ import thumbs
 from access import access_view
 from client import app
 from jobs import JOBS, NO_CONF, Job, job_kb, run_job
-from store import DEFAULTS, db
+from store import DEFAULTS, ENCODE_KEYS, db
 from utils import bot_stats_text, stats
 
 TASKS = set()
@@ -51,12 +51,14 @@ HELP_TEXT = (
     "<b>Commands</b>\n\n"
     "/genc <code>link</code> - encode and upload to GDrive\n"
     "/tenc <code>link</code> - encode and upload to Telegram\n"
+    "/gup <code>link</code> - upload to GDrive without encoding\n"
+    "/tup <code>link</code> - upload to Telegram without encoding\n"
     "<code>link</code> = GDrive folder/file link or a direct download link\n"
     "A link to an archive (zip, rar, 7z) without -e is not encoded, it is uploaded as it is. "
     "Files above 2GB are uploaded in parts.\n\n"
     "<b>Arguments</b>\n"
     "<code>-n NewName.mkv</code> - output file name (with -e: the archive name)\n"
-    "<code>-e</code> - extract the archive and encode every video inside\n"
+    "<code>-e</code> - extract the archive, then encode every video inside (/gup and /tup upload every file)\n"
     "<code>-z</code> - zip the encoded files and upload one zip\n"
     "<code>-t image_link</code> - use this thumbnail for this task (Telegram uploads)\n"
     "Example: <code>/genc https://site.com/pack.zip -e -z -n Pack.zip</code>\n\n"
@@ -72,6 +74,8 @@ ADMIN_HELP = (
     "/ua <code>user_id</code> - unauthorize a user\n"
     "/alist - authorized users\n"
     "/ualist - unauthorized users\n"
+    "/broadcast <code>text</code> (or /bc) - message everyone who started the bot; "
+    "reply to any message, sticker or photo to broadcast that instead\n"
 )
 
 OWNER_HELP = (
@@ -85,7 +89,8 @@ OWNER_HELP = (
 
 USAGE = ("Please send a link.\n<code>/genc link</code>\n<code>/tenc link</code>\n"
          "<code>/tenc direct_link -n ANIME.mkv</code>\n"
-         "<code>/genc zip_link -e -n Pack.zip</code>")
+         "<code>/genc zip_link -e -n Pack.zip</code>\n"
+         "<code>/tup link -e -n Pack.zip</code> (upload without encoding)")
 
 GD_HELP = (
     "🔗 <b>GDrive Connect (rclone)</b>\n\n"
@@ -214,11 +219,13 @@ def parse_args(m):
     return link, opts
 
 
-@app.on_message(filters.command(["genc", "tenc", "enc"]))
+@app.on_message(filters.command(["genc", "tenc", "enc", "gup", "tup"]))
 async def enc_cmd(client, m):
     if not m.from_user:
         return
-    kind = "tenc" if m.command[0].lower() == "tenc" else "genc"
+    cmd = m.command[0].lower()
+    kind = "tenc" if cmd in ("tenc", "tup") else "genc"
+    plain = cmd in ("gup", "tup")  # upload without encoding
     link, opts = parse_args(m)
     if not link:
         return await m.reply_text(USAGE)
@@ -232,7 +239,7 @@ async def enc_cmd(client, m):
         if limit and sum(1 for j in JOBS.values() if j.user_id == uid) >= limit:
             return await m.reply_text(f"You already have {limit} running task(s). Wait for them to finish.")
     job = Job(kind, m.from_user, m.chat.id, link, opts["name"], db.get_settings(uid),
-              thumb_url=opts["thumb"], extract=opts["extract"], zip_out=opts["zip"])
+              thumb_url=opts["thumb"], extract=opts["extract"], zip_out=opts["zip"], plain=plain)
     JOBS[job.id] = job
     db.bump_jobs(uid)
     task = asyncio.create_task(run_job(client, job))
@@ -250,8 +257,8 @@ def status_view(viewer):
     if not jobs:
         return "<b>No active tasks!</b>" + foot, kb
     blocks, size = [], 0
-    for j in jobs:
-        block = j.render_block()
+    for number, j in enumerate(jobs, 1):
+        block = j.render_block(number)
         if size + len(block) > 3200:
             blocks.append(f"... and {len(jobs) - len(blocks)} more task(s)")
             break
@@ -406,7 +413,7 @@ def main_text(uid):
         f"<b>Send as:</b> {'Document' if s['as_doc'] else 'Media'}\n"
         f"<b>Quality Name Swap:</b> {_on(s['swap'])}\n"
         f"<b>Tag:</b> <code>{html.escape(s['tag'])}</code>\n"
-        f"<b>Auto Delete Source:</b> {_on(s['auto_delete'])} (permanent)\n"
+        f"<b>Auto Delete Source:</b> {_on(s['auto_delete'])} (permanent, a source folder is deleted too)\n"
         f"<b>Thumbnail:</b> {'Set ✅' if thumbs.has(uid) else 'Not set'}\n"
         f"<b>GDrive:</b> {'Connected ✅' if rclone.has_conf(uid) else 'Not connected ❌'}"
     )
@@ -432,6 +439,7 @@ def main_kb(uid):
     if rclone.has_conf(uid):
         rows.append([b("❌ Remove GDrive", "rmgd")])
     rows.append([b("Close", "close")])
+    rows.append([b("🔄 Reset all", "rsall")])
     return Markup(rows)
 
 
@@ -459,6 +467,7 @@ def enc_kb(uid):
         [b("Crf", "opt|crf"), b("Preset", "opt|preset")],
         [b("Res", "opt|res"), b("Fps", "opt|fps")],
         [b("Ext", "opt|ext"), b("Abitrate", "opt|abitrate")],
+        [b("🔄 Reset", "rsenc")],
         [b("«", "menu"), b("Done", "menu"), b("Cancel", "close")],
     ])
 
@@ -547,6 +556,26 @@ async def settings_cb(client, cq):
     elif act == "rmgd":
         rclone.remove_conf(uid)
         await _show(cq, main_text(uid), main_kb(uid))
+    elif act == "rsenc":
+        await _show(cq, "🔄 <b>Reset encode settings?</b>\n\nVcodec, Acodec, Abitrate, Crf, Preset, Res, Fps and "
+                        "Ext go back to their defaults.",
+                    Markup([[Btn("✅ Yes, reset", callback_data=f"st|{uid}|rsenc_y"),
+                             Btn("❌ No", callback_data=f"st|{uid}|enc")]]))
+    elif act == "rsenc_y":
+        db.reset_settings(uid, ENCODE_KEYS)
+        await _show(cq, enc_text(uid), enc_kb(uid))
+        return await cq.answer("Encode settings reset.")
+    elif act == "rsall":
+        await _show(cq, "🔄 <b>Reset all settings?</b>\n\nEncode settings, Quality Name Swap, Send as, Tag, "
+                        "Auto Delete and your thumbnail go back to the defaults.\n"
+                        "Your GDrive connection stays connected.",
+                    Markup([[Btn("✅ Yes, reset all", callback_data=f"st|{uid}|rsall_y"),
+                             Btn("❌ No", callback_data=f"st|{uid}|menu")]]))
+    elif act == "rsall_y":
+        db.reset_settings(uid)
+        thumbs.remove(uid)
+        await _show(cq, main_text(uid), main_kb(uid))
+        return await cq.answer("All settings reset.")
     await cq.answer()
 
 

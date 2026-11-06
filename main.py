@@ -17,6 +17,7 @@ from client import app  # noqa: E402
 import handlers  # noqa: E402,F401  (registers handlers)
 import access  # noqa: E402,F401
 import botsettings  # noqa: E402,F401
+import broadcast  # noqa: E402,F401
 import menu  # noqa: E402
 import panel  # noqa: E402,F401
 
