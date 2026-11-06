@@ -12,42 +12,27 @@ loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
 from pyrogram import idle  # noqa: E402
-from pyrogram.types import BotCommand, BotCommandScopeChat  # noqa: E402
 
 from client import app  # noqa: E402
 import handlers  # noqa: E402,F401  (registers handlers)
+import access  # noqa: E402,F401
+import botsettings  # noqa: E402,F401
+import menu  # noqa: E402
 import panel  # noqa: E402,F401
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("main")
-
-USER_COMMANDS = [
-    BotCommand("start", "Start the bot"),
-    BotCommand("help", "All commands"),
-    BotCommand("settings", "Encode, GDrive and upload settings"),
-    BotCommand("genc", "Encode and upload to GDrive"),
-    BotCommand("tenc", "Encode and upload to Telegram"),
-    BotCommand("rclone", "Save your rclone.conf"),
-    BotCommand("status", "Running jobs"),
-    BotCommand("cancel", "Cancel a job"),
-]
-OWNER_COMMANDS = USER_COMMANDS + [
-    BotCommand("panel", "User control panel"),
-    BotCommand("restart", "Restart the bot"),
-]
-
 
 async def main():
     shutil.rmtree(config.WORK_DIR, ignore_errors=True)
     os.makedirs(config.WORK_DIR, exist_ok=True)
 
     await app.start()
-    await app.set_bot_commands(USER_COMMANDS)
+    await menu.apply_all(app)
     try:
-        await app.set_bot_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(chat_id=config.OWNER_ID))
-        await app.send_message(config.OWNER_ID, "✅ Start the boted.")
+        await app.send_message(config.OWNER_ID, "✅ Bot started.")
     except Exception as e:
-        log.warning("Owner setup skipped (owner must /start the bot once): %s", e)
+        log.warning("Owner notification skipped (the owner must send /start to the bot once): %s", e)
     log.info("Bot is running.")
     await idle()
     await app.stop()

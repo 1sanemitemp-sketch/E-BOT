@@ -7,7 +7,7 @@ import re
 import aiohttp
 
 import config
-from utils import Cancelled, run_proc
+from utils import Cancelled, run_proc, watch_dir
 
 
 class RcloneError(Exception):
@@ -150,21 +150,8 @@ def _make_cb(job):
     return cb, errs
 
 
-async def _watch_dir(path, total, job):
-    while True:
-        await asyncio.sleep(2)
-        size = 0
-        for root, _, files in os.walk(path):
-            for f in files:
-                try:
-                    size += os.path.getsize(os.path.join(root, f))
-                except OSError:
-                    pass
-        job.set_progress(size, total)
-
-
 async def _run(job, args, on_err=None, errs=None, watch=None):
-    watcher = asyncio.create_task(_watch_dir(*watch)) if watch else None
+    watcher = asyncio.create_task(watch_dir(*watch)) if watch else None
     try:
         rc, tail = await run_proc(_argv(job.user_id, args), job, on_stderr=on_err)
     finally:
@@ -192,12 +179,45 @@ async def download_id(job, remote, gid, dst, total):
 async def upload(job, remote, local, dest_dir, parent_id):
     name = os.path.basename(local)
     cb, errs = _make_cb(job)
-    args = ["copyto", local, f"{remote}:{dest_dir}/{name}", *STATS_FLAGS,
+    target = f"{remote}:{dest_dir}/{name}" if dest_dir else f"{remote}:{name}"
+    args = ["copyto", local, target, *STATS_FLAGS,
             "--drive-chunk-size", "64M"]
     if parent_id:
         args += ["--drive-root-folder-id", parent_id]
     await _run(job, args, on_err=cb, errs=errs)
 
 
-async def delete_path(uid, remote, root_id, rel_path):
-    await _simple(uid, ["deletefile", f"{remote}:{rel_path}", "--drive-root-folder-id", root_id], 120)
+async def delete_id(uid, remote, fid):
+    """Permanently delete a Drive file by ID (skips the trash). Returns True on success."""
+    try:
+        await _simple(uid, ["about", f"{remote}:"], 90)  # refresh the token
+        token = _access_token(uid, remote)
+        async with aiohttp.ClientSession() as s:
+            async with s.delete(f"https://www.googleapis.com/drive/v3/files/{fid}",
+                                params={"supportsAllDrives": "true"},
+                                headers={"Authorization": f"Bearer {token}"}) as resp:
+                return resp.status in (200, 204)
+    except Exception:
+        return False
+
+
+async def path_link(uid, remote, path, parent_id):
+    """Return (Drive URL, is_folder) for an uploaded file or folder, or (None, False)."""
+    root = ["--drive-root-folder-id", parent_id] if parent_id else []
+    try:
+        rc, out, _ = await _simple(uid, ["lsjson", "--stat", f"{remote}:{path}", *root], 120)
+        if rc == 0:
+            d = json.loads(out)
+            fid, is_dir = d.get("ID"), bool(d.get("IsDir"))
+            if fid:
+                if is_dir:
+                    return f"https://drive.google.com/drive/folders/{fid}", True
+                return f"https://drive.google.com/file/d/{fid}/view", False
+        rc, out, _ = await _simple(uid, ["lsjson", "--dirs-only", f"{remote}:", *root], 180)
+        if rc == 0:
+            for d in json.loads(out or "[]"):
+                if d.get("Name") == path and d.get("ID"):
+                    return f"https://drive.google.com/drive/folders/{d['ID']}", True
+    except Exception:
+        pass
+    return None, False

@@ -8,13 +8,15 @@ from pyrogram.types import InlineKeyboardButton as Btn
 from pyrogram.types import InlineKeyboardMarkup as Markup
 
 import config
+import menu
+from access import set_auth_state
 from client import app
 from jobs import JOBS
 from store import db
 
 PER_PAGE = 8
-TITLES = {"all": "All Users", "active": "Active (24h)", "muted": "Muted",
-          "banned": "Banned", "admins": "Admins"}
+TITLES = {"all": "All Users", "active": "Active (24h)", "pending": "Pending", "approved": "Approved",
+          "rejected": "Rejected", "muted": "Muted", "banned": "Banned", "admins": "Admins"}
 
 
 def _is_owner(_, __, u):
@@ -34,13 +36,18 @@ def main_view():
         "👑 <b>Admin Panel</b>\n\n"
         f"Total users: <b>{c['all']}</b>\n"
         f"Active (24h): <b>{c['active']}</b>\n"
+        f"Pending approval: <b>{c['pending']}</b>\n"
+        f"Approved: <b>{c['approved']}</b>\n"
+        f"Rejected: <b>{c['rejected']}</b>\n"
         f"Muted: <b>{c['muted']}</b>\n"
         f"Banned: <b>{c['banned']}</b>\n"
         f"Admins: <b>{c['admins']}</b>\n"
         f"Running jobs: <b>{len(JOBS)}</b>"
     )
-    rows = [[Btn(f"👥 {TITLES[k]} ({c[k]})", callback_data=f"pn|list|{k}|0")]
-            for k in ("all", "active", "muted", "banned", "admins")]
+    keys = list(TITLES)
+    rows = []
+    for i in range(0, len(keys), 2):
+        rows.append([Btn(f"{TITLES[k]} ({c[k]})", callback_data=f"pn|list|{k}|0") for k in keys[i:i + 2]])
     rows.append([Btn("Close", callback_data="pn|close")])
     return text, Markup(rows)
 
@@ -77,11 +84,15 @@ def user_view(uid, flt="all", page=0):
     if not u:
         return "User not found.", Markup([[Btn("« Back", callback_data="pn|main")]])
     status = {"active": "Active", "muted": "Muted 🔇", "banned": "Banned 🚫"}[u["status"]]
+    auth = db.auth_of(u)
+    auth_text = {"new": "Not requested", "pending": "Pending ⏳", "approved": "Approved ✅",
+                 "rejected": "Rejected ❌"}.get(auth, auth)
     text = (
         f"👤 <b>{html.escape(u['name'])}</b>\n"
         f"ID: <code>{u['id']}</code>\n"
         f"Username: {'@' + u['username'] if u.get('username') else '-'}\n"
         f"Status: {status}\n"
+        f"Access: {auth_text}\n"
         f"Role: {'Admin ⭐' if u.get('admin') else 'User'}\n"
         f"First seen: {_fmt(u.get('first_seen'))}\n"
         f"Last seen: {_fmt(u.get('last_seen'))}\n"
@@ -92,6 +103,10 @@ def user_view(uid, flt="all", page=0):
         def a(t, act):
             return Btn(t, callback_data=f"pn|act|{act}|{u['id']}|{flt}|{page}")
 
+        if auth == "approved":
+            rows.append([a("🚫 Unauthorize", "reject")])
+        else:
+            rows.append([a("✅ Approve", "approve"), a("❌ Reject", "reject")])
         rows.append([
             a("🔊 Unmute" if u["status"] == "muted" else "🔇 Mute",
               "unmute" if u["status"] == "muted" else "mute"),
@@ -134,10 +149,13 @@ async def panel_cb(client, cq):
                 db.set_status(uid, "banned")
             elif action in ("unmute", "unban"):
                 db.set_status(uid, "active")
-            elif action == "admin":
-                db.set_admin(uid, True)
-            elif action == "unadmin":
-                db.set_admin(uid, False)
+            elif action == "approve":
+                await set_auth_state(client, uid, "approved")
+            elif action == "reject":
+                await set_auth_state(client, uid, "rejected")
+            elif action in ("admin", "unadmin"):
+                db.set_admin(uid, action == "admin")
+                await menu.apply_menu(client, uid)
         text, kb = user_view(uid, flt, int(page))
     elif act == "user":
         text, kb = user_view(int(p[2]), p[3], int(p[4]))

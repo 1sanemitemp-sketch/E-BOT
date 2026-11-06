@@ -3,7 +3,6 @@ import json
 import os
 import re
 
-import config
 from utils import Cancelled, UserError, cpu_limit, run_proc
 
 EXTS = {"mkv", "mp4", "avi", "webm", "ts", "mov"}
@@ -47,6 +46,13 @@ def quality_label(settings, src_height):
     return f"{h}p"
 
 
+def swap_quality(text, label, swap):
+    """Replace the first quality token (e.g. 1080p) in text with label when swap is on."""
+    if swap and QUAL_RE.search(text):
+        return QUAL_RE.sub(label, text, count=1)
+    return text
+
+
 def output_name(src_name, label, swap, ext, custom=None):
     """Returns (final file name, container extension)."""
     if custom:
@@ -71,6 +77,13 @@ def output_name(src_name, label, swap, ext, custom=None):
     return f"{new}.{ext}", ext
 
 
+def folder_name(base, label, swap, tag):
+    """Output folder/zip name: {tag} {base}, with the quality token swapped when swap is on."""
+    if swap and label and QUAL_RE.search(base):
+        base = QUAL_RE.sub(label, base, count=1)
+    return f"{tag} {base}"
+
+
 def build_cmd(src, dst, s, ext, with_subs):
     v, a = s["vcodec"], s["acodec"]
     threads = str(max(1, min(cpu_limit(), 16)))
@@ -92,9 +105,9 @@ def build_cmd(src, dst, s, ext, with_subs):
             if v == "libx265" and ext in ("mp4", "mov"):
                 cmd += ["-tag:v", "hvc1"]
         elif v == "libvpx-vp9":
-            cmd += ["-crf", crf, "-b:v", "0", "-row-mt", "1", "-cpu-used", "4", "-pix_fmt", "yuv420p"]
+            cmd += ["-crf", str(round(float(crf))), "-b:v", "0", "-row-mt", "1", "-cpu-used", "4", "-pix_fmt", "yuv420p"]
         elif v == "libaom-av1":
-            cmd += ["-crf", crf, "-b:v", "0", "-cpu-used", "6", "-pix_fmt", "yuv420p"]
+            cmd += ["-crf", str(round(float(crf))), "-b:v", "0", "-cpu-used", "6", "-pix_fmt", "yuv420p"]
         h = res_height(s.get("res"))
         if h:
             cmd += ["-vf", f"scale=-2:{h}"]
@@ -105,8 +118,7 @@ def build_cmd(src, dst, s, ext, with_subs):
         cmd += ["-c:a", "copy"]
     else:
         enc = "libopus" if a == "opus" else a
-        br = "384k" if a == "ac3" else config.AUDIO_BITRATE
-        cmd += ["-c:a", enc, "-b:a", br]
+        cmd += ["-c:a", enc, "-b:a", str(s.get("abitrate") or "128k")]
 
     cmd += ["-max_muxing_queue_size", "9999", dst]
     return cmd

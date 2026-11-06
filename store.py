@@ -13,10 +13,22 @@ DEFAULTS = {
     "res": "",
     "fps": "",
     "ext": "mkv",
-    "swap": True,        # QUALITY NAME SWAP (default ON)
-    "as_doc": False,     # False = send as media, True = send as document
-    "auto_delete": False,  # delete GDrive original after upload (default OFF)
+    "swap": True,          # QUALITY NAME SWAP (default ON)
+    "as_doc": False,       # False = send as media, True = send as document
+    "auto_delete": False,  # permanently delete the GDrive source after upload (default OFF)
+    "abitrate": "128k",
+    "tag": f"[{config.TAG_NAME}]",  # prefix of output folder / zip names, editable per user
 }
+
+BOT_DEFAULTS = {
+    "max_concurrent": config.MAX_CONCURRENT,
+    "user_limit": 0,            # tasks per user at the same time, 0 = unlimited
+    "approval_required": True,
+    "split_gdrive": True,       # also split zips above 2GB into parts for GDrive
+    "accept_tasks": True,
+}
+
+LIST_FILTERS = ("all", "active", "pending", "approved", "rejected", "muted", "banned", "admins")
 
 
 class Store:
@@ -33,6 +45,7 @@ class Store:
                 os.replace(path, path + ".bak")
         self.data.setdefault("users", {})
         self.data.setdefault("settings", {})
+        self.data.setdefault("bot", {})
 
     def save(self):
         with self._lock:
@@ -43,6 +56,10 @@ class Store:
             self._last_save = time.time()
 
     # ---------- users ----------
+    def _new_record(self, uid, name, uname, now):
+        return {"id": uid, "name": name, "username": uname, "first_seen": now,
+                "last_seen": now, "status": "active", "admin": False, "jobs": 0, "auth": "new"}
+
     def touch(self, user):
         uid = str(user.id)
         now = time.time()
@@ -50,8 +67,7 @@ class Store:
         uname = user.username or ""
         rec = self.data["users"].get(uid)
         if rec is None:
-            rec = {"id": user.id, "name": name, "username": uname, "first_seen": now,
-                   "last_seen": now, "status": "active", "admin": False, "jobs": 0}
+            rec = self._new_record(user.id, name, uname, now)
             self.data["users"][uid] = rec
             self.save()
             return rec
@@ -59,6 +75,16 @@ class Store:
         rec.update(name=name, username=uname, last_seen=now)
         if changed or now - self._last_save > 60:
             self.save()
+        return rec
+
+    def ensure_user(self, uid):
+        rec = self.get_user(uid)
+        if rec:
+            return rec
+        rec = self._new_record(uid, str(uid), "", time.time())
+        rec["last_seen"] = 0
+        self.data["users"][str(uid)] = rec
+        self.save()
         return rec
 
     def get_user(self, uid):
@@ -71,10 +97,11 @@ class Store:
             self.save()
 
     def set_admin(self, uid, flag):
-        rec = self.get_user(uid)
-        if rec:
-            rec["admin"] = bool(flag)
-            self.save()
+        rec = self.ensure_user(uid)
+        rec["admin"] = bool(flag)
+        if flag:
+            rec["auth"] = "approved"
+        self.save()
 
     def bump_jobs(self, uid):
         rec = self.get_user(uid)
@@ -82,21 +109,57 @@ class Store:
             rec["jobs"] = rec.get("jobs", 0) + 1
             self.save()
 
+    # ---------- authorization ----------
+    @staticmethod
+    def auth_of(rec):
+        # records created before the approval system existed are treated as approved
+        return rec.get("auth", "approved")
+
+    def set_auth(self, uid, state):
+        rec = self.ensure_user(uid)
+        rec["auth"] = state
+        rec["auth_time"] = time.time()
+        self.save()
+
     def is_admin(self, uid):
         if uid == config.OWNER_ID:
             return True
         rec = self.get_user(uid)
         return bool(rec and rec.get("admin"))
 
+    def is_authorized(self, uid):
+        if not self.get_bot("approval_required"):
+            return True
+        if self.is_admin(uid):
+            return True
+        rec = self.get_user(uid)
+        return bool(rec and self.auth_of(rec) == "approved")
+
+    def admin_ids(self):
+        ids = {config.OWNER_ID}
+        ids.update(u["id"] for u in self.data["users"].values() if u.get("admin"))
+        return ids
+
+    # ---------- lists ----------
     def list_users(self, flt="all"):
         now = time.time()
         out = []
         for u in self.data["users"].values():
+            auth = self.auth_of(u)
+            staff = bool(u.get("admin")) or u["id"] == config.OWNER_ID
             if flt == "muted" and u.get("status") != "muted":
                 continue
             if flt == "banned" and u.get("status") != "banned":
                 continue
             if flt == "admins" and not u.get("admin"):
+                continue
+            if flt == "pending" and not (auth == "pending" and not staff):
+                continue
+            if flt == "approved" and not (auth == "approved" and not staff):
+                continue
+            if flt == "rejected" and not (auth == "rejected" and not staff):
+                continue
+            if flt == "unauthorized" and (staff or auth == "approved"):
                 continue
             if flt == "active" and not (u.get("status") == "active"
                                         and now - u.get("last_seen", 0) < 86400):
@@ -106,7 +169,15 @@ class Store:
         return out
 
     def counts(self):
-        return {k: len(self.list_users(k)) for k in ("all", "active", "muted", "banned", "admins")}
+        return {k: len(self.list_users(k)) for k in LIST_FILTERS}
+
+    # ---------- global bot settings ----------
+    def get_bot(self, key):
+        return self.data["bot"].get(key, BOT_DEFAULTS[key])
+
+    def set_bot(self, key, value):
+        self.data["bot"][key] = value
+        self.save()
 
     # ---------- settings ----------
     def get_settings(self, uid):

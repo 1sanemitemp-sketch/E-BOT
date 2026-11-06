@@ -154,3 +154,63 @@ def cpu_limit():
     except Exception:
         pass
     return os.cpu_count() or 2
+
+
+async def watch_dir(path, total, job):
+    """Report the size of a directory as job progress (used while rclone/7z write files)."""
+    while True:
+        await asyncio.sleep(2)
+        size = 0
+        for root, _, files in os.walk(path):
+            for f in files:
+                try:
+                    size += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        job.set_progress(size, total)
+
+
+ARCHIVE_EXT = {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".001"}
+ARCHIVE_MAGIC = (b"PK\x03\x04", b"Rar!", b"7z\xbc\xaf\x27\x1c")
+
+
+def is_archive(path):
+    if os.path.splitext(path)[1].lower() in ARCHIVE_EXT:
+        return True
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return False
+    return head.startswith(ARCHIVE_MAGIC)
+
+
+def split_file(job, path, part_size):
+    """Split a file into numbered parts (name.001, name.002, ...). Blocking, run it in a thread."""
+    total = os.path.getsize(path)
+    done = 0
+    parts = []
+    with open(path, "rb") as src:
+        index = 0
+        while True:
+            index += 1
+            part = f"{path}.{index:03d}"
+            written = 0
+            with open(part, "wb") as dst:
+                while written < part_size:
+                    if job.cancelled:
+                        raise Cancelled()
+                    chunk = src.read(min(1 << 20, part_size - written))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    written += len(chunk)
+                    done += len(chunk)
+                    job.set_progress(done, total)
+            if written == 0:
+                os.remove(part)
+                break
+            parts.append(part)
+            if written < part_size:
+                break
+    return parts

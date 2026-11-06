@@ -15,7 +15,6 @@ OWNER_ID = _int("OWNER_ID")
 
 TAG_NAME = os.getenv("TAG_NAME", "Blaze Ash")
 MAX_CONCURRENT = max(1, _int("MAX_CONCURRENT", 1))
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 STATUS_INTERVAL = max(3, _int("STATUS_INTERVAL", 5))
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
@@ -28,6 +27,10 @@ except Exception:
     os.makedirs(DATA_DIR, exist_ok=True)
 
 RCLONE_DIR = os.path.join(DATA_DIR, "rclone")
+THUMB_DIR = os.path.join(DATA_DIR, "thumbs")
+ADMIN_CONTACTS = os.getenv("ADMIN_CONTACTS", "@sanemi111 @abbacalling420")
+THUMB_DIR = os.path.join(DATA_DIR, "thumbs")
+APPROVAL_CONTACTS = [x.strip() for x in os.getenv("APPROVAL_CONTACTS", "@sanemi111,@abbacalling420").split(",") if x.strip()]
 WORK_DIR = os.getenv("WORK_DIR", "/tmp/encbot")
 TG_LIMIT = 2000 * 1024 * 1024  # Telegram bot upload limit
 

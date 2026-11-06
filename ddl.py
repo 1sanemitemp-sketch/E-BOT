@@ -111,16 +111,20 @@ async def _parallel(s, url, path, total, job):
             raise
 
 
-async def download(url, dest_dir, job):
+async def download(url, dest_dir, job, local_name=None):
     """Download a direct link. Uses several parallel connections when the server supports ranges."""
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
     connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector,
                                      headers={"User-Agent": USER_AGENT}) as s:
         name, total, ranged = await _probe(s, url)
-        job.file_name = job.custom_name or name
+        if local_name:
+            if not os.path.splitext(local_name)[1]:
+                local_name += os.path.splitext(name)[1]
+            name = safe_name(local_name)
+        job.file_name = name if local_name else (job.custom_name or name)
         job.total = total
-        path = os.path.join(dest_dir, name)
+        path = os.path.join(dest_dir, safe_name(save_as) if save_as else name)
         if ranged and total >= PART_SIZE:
             await _parallel(s, url, path, total, job)
         else:
