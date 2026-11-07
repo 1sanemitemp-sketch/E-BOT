@@ -13,7 +13,6 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = _int("OWNER_ID")
 
-TAG_NAME = os.getenv("TAG_NAME", "Blaze Ash")
 MAX_CONCURRENT = max(1, _int("MAX_CONCURRENT", 1))
 STATUS_INTERVAL = max(3, _int("STATUS_INTERVAL", 5))
 

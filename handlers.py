@@ -11,12 +11,14 @@ from pyrogram.errors import MessageNotModified
 from pyrogram.types import InlineKeyboardButton as Btn
 from pyrogram.types import InlineKeyboardMarkup as Markup
 
+import autorename
+import board
 import config
 import rclone
 import thumbs
 from access import access_view
 from client import app
-from jobs import JOBS, NO_CONF, Job, job_kb, run_job
+from jobs import JOBS, NO_CONF, Job, run_job
 from store import DEFAULTS, ENCODE_KEYS, db
 from utils import bot_stats_text, stats
 
@@ -249,40 +251,11 @@ async def enc_cmd(client, m):
 
 
 # ------------------------------------------------------------------ status / cancel
-def status_view(viewer):
-    admin = db.is_admin(viewer)
-    jobs = [j for j in JOBS.values() if admin or j.user_id == viewer]
-    kb = Markup([[Btn("📊 Stats", callback_data="jt|x"), Btn("♻️ Refresh", callback_data="sr|x")]])
-    foot = f"\n\n⌬ <b>Bot Stats</b>\n{bot_stats_text()}"
-    if not jobs:
-        return "<b>No active tasks!</b>" + foot, kb
-    blocks, size = [], 0
-    for number, j in enumerate(jobs, 1):
-        block = j.render_block(number)
-        if size + len(block) > 3200:
-            blocks.append(f"... and {len(jobs) - len(blocks)} more task(s)")
-            break
-        blocks.append(block)
-        size += len(block)
-    return "\n\n".join(blocks) + foot, kb
-
-
 @app.on_message(filters.command("status"))
 async def status_cmd(client, m):
-    if not m.from_user:
-        return
-    text, kb = status_view(m.from_user.id)
-    await m.reply_text(text, reply_markup=kb)
-
-
-@app.on_callback_query(filters.regex(r"^sr\|"))
-async def status_refresh_cb(client, cq):
-    text, kb = status_view(cq.from_user.id)
-    try:
-        await cq.message.edit_text(text, reply_markup=kb)
-    except MessageNotModified:
-        pass
-    await cq.answer("Refreshed")
+    """Show the shared status board: every running task of every user."""
+    if m.from_user:
+        await board.ensure(client, m.chat.id, auto=False, fresh=True)
 
 
 async def _cancel(m, job):
@@ -313,29 +286,6 @@ async def cancel_cmd(client, m):
 async def cancel_link_cmd(client, m):
     if m.from_user:
         await _cancel(m, JOBS.get(m.matches[0].group(1)))
-
-
-@app.on_callback_query(filters.regex(r"^jc\|"))
-async def cancel_cb(client, cq):
-    job = JOBS.get(cq.data.split("|")[1])
-    if not job:
-        return await cq.answer("This task has already finished.", show_alert=True)
-    if not (db.is_admin(cq.from_user.id) or job.user_id == cq.from_user.id):
-        return await cq.answer("This is not your task.", show_alert=True)
-    job.cancel()
-    await cq.answer("Cancelling...")
-
-
-@app.on_callback_query(filters.regex(r"^jr\|"))
-async def refresh_cb(client, cq):
-    job = JOBS.get(cq.data.split("|")[1])
-    if not job:
-        return await cq.answer("This task has already finished.", show_alert=True)
-    try:
-        await cq.message.edit_text(job.render(), reply_markup=job_kb(job.id))
-    except MessageNotModified:
-        pass
-    await cq.answer("Refreshed")
 
 
 @app.on_callback_query(filters.regex(r"^jt\|"))
@@ -412,7 +362,8 @@ def main_text(uid):
         f"{s['preset']} / {s['res'] or 'Auto'} / {s['ext']}\n"
         f"<b>Send as:</b> {'Document' if s['as_doc'] else 'Media'}\n"
         f"<b>Quality Name Swap:</b> {_on(s['swap'])}\n"
-        f"<b>Tag:</b> <code>{html.escape(s['tag'])}</code>\n"
+        f"<b>Tag:</b> {'<code>' + html.escape(s['tag']) + '</code>' if s['tag'] else 'Not set'}\n"
+        f"<b>Auto Rename:</b> {'<code>' + html.escape(s['auto_rename']) + '</code>' if s['auto_rename'] else 'Off'}\n"
         f"<b>Auto Delete Source:</b> {_on(s['auto_delete'])} (permanent, a source folder is deleted too)\n"
         f"<b>Thumbnail:</b> {'Set ✅' if thumbs.has(uid) else 'Not set'}\n"
         f"<b>GDrive:</b> {'Connected ✅' if rclone.has_conf(uid) else 'Not connected ❌'}"
@@ -429,7 +380,8 @@ def main_kb(uid):
         [b("🎛 Encode Settings", "enc")],
         [b(("🟢 " if s["swap"] else "⚪ ") + f"QUALITY NAME SWAP : {_on(s['swap'])}", "swap")],
         [b("📤 Send as: " + ("Document" if s["as_doc"] else "Media"), "asdoc")],
-        [b("🏷 Tag: " + s["tag"][:30], "tag")],
+        [b("🏷 Tag: " + (s["tag"][:30] or "Not set"), "tag")],
+        [b("✏️ Auto Rename: " + ("ON" if s["auto_rename"] else "OFF"), "rn")],
         [b("🗑 Auto Delete Source: " + _on(s["auto_delete"]), "autodel")],
         [b("🖼 Set Thumbnail", "thumb")],
     ]
@@ -440,6 +392,25 @@ def main_kb(uid):
         rows.append([b("❌ Remove GDrive", "rmgd")])
     rows.append([b("Close", "close")])
     rows.append([b("🔄 Reset all", "rsall")])
+    return Markup(rows)
+
+
+def rename_text(uid):
+    fmt = db.get_settings(uid)["auto_rename"]
+    return ("✏️ <b>Auto Rename</b>\n\nFormat: " + (f"<code>{html.escape(fmt)}</code>" if fmt else "Not set (off)") +
+            "\n\nEvery output file is named from this format. It is not used when you give a name with -n.")
+
+
+def rename_kb(uid):
+    fmt = db.get_settings(uid)["auto_rename"]
+
+    def b(t, a):
+        return Btn(t, callback_data=f"st|{uid}|{a}")
+
+    rows = [[b("✏️ Set Format", "rnset")], [b("📖 VIEW ALL AVAILABLE FORMATS", "rnguide")]]
+    if fmt:
+        rows.append([b("❌ Turn off", "rnoff")])
+    rows.append([b("« Back", "menu")])
     return Markup(rows)
 
 
@@ -454,11 +425,14 @@ def enc_text(uid):
         f"Preset: <code>{s['preset']}</code>\n"
         f"Res: <code>{s['res']}</code>\n"
         f"Fps: <code>{s['fps']}</code>\n"
-        f"Ext: <code>{s['ext']}</code>"
+        f"Ext: <code>{s['ext']}</code>\n"
+        f"Color Fix: <code>{'ON' if s['colorfix'] else 'OFF'}</code>"
     )
 
 
 def enc_kb(uid):
+    s = db.get_settings(uid)
+
     def b(t, a):
         return Btn(t, callback_data=f"st|{uid}|{a}")
 
@@ -467,6 +441,7 @@ def enc_kb(uid):
         [b("Crf", "opt|crf"), b("Preset", "opt|preset")],
         [b("Res", "opt|res"), b("Fps", "opt|fps")],
         [b("Ext", "opt|ext"), b("Abitrate", "opt|abitrate")],
+        [b("🎨 Color Fix: " + ("ON" if s["colorfix"] else "OFF"), "cfix")],
         [b("🔄 Reset", "rsenc")],
         [b("«", "menu"), b("Done", "menu"), b("Cancel", "close")],
     ])
@@ -528,15 +503,34 @@ async def settings_cb(client, cq):
         await _show(cq, main_text(uid), main_kb(uid))
     elif act == "tag":
         AWAIT[uid] = ("tag", time.time(), 0)
-        cur = html.escape(db.get_settings(uid)["tag"])
-        await _show(cq, "🏷 <b>Tag</b>\n\nCurrent: <code>" + cur + "</code>\n\n"
-                        "Send the new tag as a message. It is put in front of the output folder and "
-                        "zip names, for example <code>" + cur + " NAME S01 720p</code>.",
-                    Markup([[Btn("Reset to default", callback_data=f"st|{uid}|tagreset")],
+        cur = db.get_settings(uid)["tag"]
+        example = (cur or "[My Tag]") + " NAME S01 720p"
+        await _show(cq, "🏷 <b>Tag</b>\n\nCurrent: " + (f"<code>{html.escape(cur)}</code>" if cur else "Not set") +
+                    "\n\nSend the new tag as a message. It is put in front of the output folder and zip names, "
+                    f"for example <code>{html.escape(example)}</code>. Without a tag the name is used as it is.",
+                    Markup([[Btn("❌ Remove tag", callback_data=f"st|{uid}|tagreset")],
                             [Btn("« Back", callback_data=f"st|{uid}|menu")]]))
     elif act == "tagreset":
         db.set_setting(uid, "tag", DEFAULT_TAG)
         await _show(cq, main_text(uid), main_kb(uid))
+    elif act == "rn":
+        await _show(cq, rename_text(uid), rename_kb(uid))
+    elif act == "rnset":
+        AWAIT[uid] = ("rename", time.time(), 0)
+        await _show(cq, "✏️ <b>Set Auto Rename format</b>\n\nSend the format as a message, for example:\n"
+                        "<code>{name} {season} - {episode} [{resolution}] [{shortlang}]{extension}</code>\n\n"
+                        "Tap VIEW ALL AVAILABLE FORMATS on the previous screen to see every placeholder.",
+                    Markup([[Btn("📖 VIEW ALL AVAILABLE FORMATS", callback_data=f"st|{uid}|rnguide")],
+                            [Btn("« Back", callback_data=f"st|{uid}|rn")]]))
+    elif act == "rnguide":
+        await _show(cq, autorename.GUIDE_HTML, Markup([[Btn("✏️ Set Format", callback_data=f"st|{uid}|rnset")],
+                                                       [Btn("« Back", callback_data=f"st|{uid}|rn")]]))
+    elif act == "rnoff":
+        db.set_setting(uid, "auto_rename", "")
+        await _show(cq, rename_text(uid), rename_kb(uid))
+    elif act == "cfix":
+        db.set_setting(uid, "colorfix", not db.get_settings(uid)["colorfix"])
+        await _show(cq, enc_text(uid), enc_kb(uid))
     elif act == "thumb":
         AWAIT[uid] = ("thumb", time.time(), 0)
         await _show(cq, "🖼 <b>Set Thumbnail</b>\n\nSend a photo, an image file, or a direct image link "
@@ -557,8 +551,8 @@ async def settings_cb(client, cq):
         rclone.remove_conf(uid)
         await _show(cq, main_text(uid), main_kb(uid))
     elif act == "rsenc":
-        await _show(cq, "🔄 <b>Reset encode settings?</b>\n\nVcodec, Acodec, Abitrate, Crf, Preset, Res, Fps and "
-                        "Ext go back to their defaults.",
+        await _show(cq, "🔄 <b>Reset encode settings?</b>\n\nVcodec, Acodec, Abitrate, Crf, Preset, Res, Fps, "
+                        "Ext and Color Fix go back to their defaults.",
                     Markup([[Btn("✅ Yes, reset", callback_data=f"st|{uid}|rsenc_y"),
                              Btn("❌ No", callback_data=f"st|{uid}|enc")]]))
     elif act == "rsenc_y":
@@ -581,7 +575,7 @@ async def settings_cb(client, cq):
 
 @app.on_message(filters.photo | filters.document | filters.text, group=1)
 async def await_input(client, m):
-    """Receives the next message after a prompt (thumbnail, tag or rclone.conf)."""
+    """Receives the next message after a prompt (thumbnail, tag, rename format or rclone.conf)."""
     if not m.from_user or m.from_user.id not in AWAIT:
         return
     uid = m.from_user.id
@@ -603,6 +597,17 @@ async def await_input(client, m):
         db.set_setting(uid, "tag", tag)
         AWAIT.pop(uid, None)
         return await m.reply_text(f"✅ Tag set to <code>{html.escape(tag)}</code>.")
+
+    if kind == "rename":
+        ok, result = autorename.validate_format(text)
+        if not ok:
+            return await m.reply_text(f"❌ {html.escape(result)}")
+        db.set_setting(uid, "auto_rename", result)
+        AWAIT.pop(uid, None)
+        return await m.reply_text(
+            f"✅ Auto Rename format saved:\n<code>{html.escape(result)}</code>\n\n"
+            f"Example: <code>{html.escape(autorename.EXAMPLE_FILE)}</code>\n→ "
+            f"<code>{html.escape(autorename.preview(result))}</code>")
 
     if kind == "rclone":
         data = None

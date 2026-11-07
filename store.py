@@ -17,18 +17,20 @@ DEFAULTS = {
     "as_doc": False,       # False = send as media, True = send as document
     "auto_delete": False,  # permanently delete the GDrive source after upload (default OFF)
     "abitrate": "128k",
-    "tag": f"[{config.TAG_NAME}]",  # prefix of output folder / zip names, editable per user
+    "colorfix": True,         # write explicit colour tags into the encode (see encoder.color_flags)
+    "tag": "",             # prefix of output folder / zip names, set by each user (empty = no prefix)
+    "auto_rename": "",     # Auto Rename format, empty = off
 }
 
 BOT_DEFAULTS = {
     "max_concurrent": config.MAX_CONCURRENT,
     "user_limit": 0,            # tasks per user at the same time, 0 = unlimited
     "approval_required": True,
-    "split_gdrive": True,       # also split zips above 2GB into parts for GDrive
+    "split_gdrive": False,      # also split files above 2GB into parts for GDrive (off: one big file)
     "accept_tasks": True,
 }
 
-ENCODE_KEYS = ("vcodec", "acodec", "abitrate", "crf", "preset", "res", "fps", "ext")
+ENCODE_KEYS = ("vcodec", "acodec", "abitrate", "crf", "preset", "res", "fps", "ext", "colorfix")
 LIST_FILTERS = ("all", "active", "pending", "approved", "rejected", "muted", "banned", "admins")
 
 

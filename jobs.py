@@ -15,6 +15,7 @@ import config
 import ddl
 import encoder
 import rclone
+import autorename
 import thumbs
 from store import db
 from utils import (Cancelled, UserError, bar, bot_stats_text, human_size, human_time,
@@ -28,13 +29,13 @@ class Limiter:
     """Async limiter whose limit can be changed while the bot is running."""
 
     def __init__(self, limit):
-        self.limit = max(1, int(limit))
+        self.limit = max(0, int(limit))  # 0 = unlimited
         self.active = 0
         self._cond = asyncio.Condition()
 
     async def __aenter__(self):
         async with self._cond:
-            await self._cond.wait_for(lambda: self.active < self.limit)
+            await self._cond.wait_for(lambda: self.limit == 0 or self.active < self.limit)
             self.active += 1
 
     async def __aexit__(self, *exc):
@@ -44,7 +45,7 @@ class Limiter:
 
     async def set_limit(self, n):
         async with self._cond:
-            self.limit = max(1, int(n))
+            self.limit = max(0, int(n))
             self._cond.notify_all()
 
 
@@ -52,14 +53,6 @@ LIMITER = Limiter(db.get_bot("max_concurrent"))
 
 NO_CONF = ("GDrive is not connected. In a private chat send /rclone and then your rclone.conf file, "
            "or open /settings and tap GDrive Connect.")
-
-
-def job_kb(job_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Stats", callback_data=f"jt|{job_id}"),
-         InlineKeyboardButton("♻️ Refresh", callback_data=f"jr|{job_id}")],
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"jc|{job_id}")],
-    ])
 
 
 class Job:
@@ -219,25 +212,6 @@ class Job:
             lines.append(f"ℹ️ {html.escape(note)}")
         lines.append(f"Time: {human_time(time.time() - self.started)}")
         return "\n".join(lines)
-
-
-async def status_loop(client, job):
-    last = None
-    while True:
-        await asyncio.sleep(config.STATUS_INTERVAL)
-        text = job.render()
-        if text == last or job.msg is None:
-            continue
-        try:
-            await client.edit_message_text(job.chat_id, job.msg.id, text,
-                                           reply_markup=job_kb(job.id))
-        except MessageNotModified:
-            pass
-        except FloodWait as e:
-            await asyncio.sleep((getattr(e, "value", None) or getattr(e, "x", 5)) + 1)
-        except Exception:
-            log.debug("status edit failed", exc_info=True)
-        last = text
 
 
 # ---------------------------------------------------------------- source
@@ -486,6 +460,13 @@ async def passthrough(client, job, ctx, src, out_dir, use_custom, rel_dir=""):
     if use_custom and job.custom_name:
         ext = os.path.splitext(name)[1]
         name = job.custom_name if os.path.splitext(job.custom_name)[1] else job.custom_name + ext
+    elif (job.settings.get("auto_rename") and not is_archive(src)
+          and os.path.splitext(name)[1].lower() in encoder.VIDEO_EXT):
+        info = await encoder.probe(src)  # Auto Rename also names plain uploads of video files
+        if info:
+            name = autorename.render(job.settings["auto_rename"], name, info, resolution=f"{info['height']}p",
+                                     ext=os.path.splitext(name)[1],
+                                     lib=autorename.lib_from("copy", info.get("vcodec")))
     name = unique_name(job, safe_name(name), rel_dir if job.kind == "genc" else "")
     ensure_dest(job, ctx, "", name)
     if job.zip_out and not is_archive(src):  # -z: collect the file for the zip
@@ -509,15 +490,21 @@ async def encode_one(client, job, ctx, src, out_dir, use_custom):
     if not info or info["duration"] <= 0:
         raise UserError("The video file is invalid or corrupt.")
     label = encoder.quality_label(s, info["height"])
-    out_name, ext = encoder.output_name(src_name, label, s["swap"], s["ext"],
-                                        job.custom_name if use_custom else None)
+    custom = job.custom_name if use_custom else None
+    out_name, ext = encoder.output_name(src_name, label, s["swap"], s["ext"], custom)
+    if s.get("auto_rename") and not custom:
+        out_name = autorename.render(
+            s["auto_rename"], src_name, info, resolution=label, ext=ext,
+            lib=autorename.lib_from(s["vcodec"], info.get("vcodec")),
+            audio_default={"aac": "AAC", "ac3": "AC3", "opus": "Opus", "libmp3lame": "MP3"}.get(s["acodec"], ""),
+            keep_subs=ext in ("mkv", "mp4", "mov"))
     out_name = unique_name(job, safe_name(out_name))
     out_path = os.path.join(out_dir, out_name)
     job.file_name = out_name
 
     job.set_stage("encoding", "FFmpeg", unit="time")
     job.total = info["duration"]
-    await encoder.encode(job, src, out_path, s, ext, info["duration"])
+    await encoder.encode(job, src, out_path, s, ext, info["duration"], info)
     os.remove(src)
     ensure_dest(job, ctx, label, out_name)
 
@@ -714,11 +701,7 @@ async def pipeline(client, job):
 
 
 async def _finish(client, job, final):
-    """Replace the live status message with a fresh message so the mention notifies the user."""
-    try:
-        await client.delete_messages(job.chat_id, job.msg.id)
-    except Exception:
-        pass
+    """Send the result as a new message so the mention notifies the user."""
     try:
         await client.send_message(job.chat_id, final, reply_markup=job.result_markup())
     except Exception:
@@ -726,8 +709,11 @@ async def _finish(client, job, final):
 
 
 async def run_job(client, job):
-    job.msg = await client.send_message(job.chat_id, job.render(), reply_markup=job_kb(job.id))
-    updater = asyncio.create_task(status_loop(client, job))
+    import board  # imported here because board itself needs jobs.JOBS
+    try:
+        await board.ensure(client, job.chat_id)  # all tasks share one live status message per chat
+    except Exception:
+        log.warning("could not open the status board", exc_info=True)
     final = job.header("❌ <b>Stopped.</b>")
     try:
         async with LIMITER:
@@ -743,7 +729,6 @@ async def run_job(client, job):
         log.exception("job failed")
         final = job.header("❌ <b>Error</b>") + f"\n<code>{html.escape(str(e)[:500])}</code>"
     finally:
-        updater.cancel()
         JOBS.pop(job.id, None)
         shutil.rmtree(job.workdir, ignore_errors=True)
     await _finish(client, job, final)

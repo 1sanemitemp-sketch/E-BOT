@@ -2,3 +2,5 @@ kurigram
 tgcrypto
 aiohttp
 psutil
+langcodes
+language-data
