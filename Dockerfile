@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg p7zip-full curl unzip ca-certificates gcc p7zip-full \
+    ffmpeg p7zip-full curl unzip ca-certificates gcc \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://rclone.org/install.sh | bash

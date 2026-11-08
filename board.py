@@ -26,9 +26,17 @@ class Board:
         self.task = None
 
 
-def render(page=0):
+def jobs_for(chat_id):
+    """A group shows the tasks started in it. A private chat shows the tasks started in private chats,
+    plus the viewer's own group tasks."""
+    if chat_id < 0:
+        return [j for j in JOBS.values() if j.origin_id == chat_id]
+    return [j for j in JOBS.values() if j.origin_id > 0 or j.user_id == chat_id]
+
+
+def render(page=0, chat_id=0):
     """Returns (text, keyboard, page) for the given page of the task list."""
-    jobs = list(JOBS.values())
+    jobs = jobs_for(chat_id)
     foot = f"\n\n⌬ <b>Bot Stats</b>\n{bot_stats_text()}"
     if not jobs:
         kb = Markup([[Btn("📊 Stats", callback_data="jt|x"), Btn("♻️ Refresh", callback_data="sr|0")]])
@@ -51,7 +59,7 @@ def render(page=0):
 
 
 async def _edit(client, b):
-    text, kb, b.page = render(b.page)
+    text, kb, b.page = render(b.page, b.chat_id)
     try:
         await client.edit_message_text(b.chat_id, b.msg_id, text, reply_markup=kb)
     except MessageNotModified:
@@ -67,7 +75,7 @@ async def _loop(client, b):
         await asyncio.sleep(config.STATUS_INTERVAL)
         if BOARDS.get(b.chat_id) is not b:
             return  # replaced by a newer board
-        if not JOBS:
+        if not jobs_for(b.chat_id):
             break
         await _edit(client, b)
     BOARDS.pop(b.chat_id, None)
@@ -94,7 +102,7 @@ async def ensure(client, chat_id, auto=True, fresh=False):
                 await client.delete_messages(chat_id, b.msg_id)
             except Exception:
                 pass
-        text, kb, _ = render(0)
+        text, kb, _ = render(0, chat_id)
         msg = await client.send_message(chat_id, text, reply_markup=kb)
         b = Board(chat_id, msg.id, auto)
         BOARDS[chat_id] = b
@@ -104,7 +112,7 @@ async def ensure(client, chat_id, auto=True, fresh=False):
 
 @app.on_callback_query(filters.regex(r"^sr\|"))
 async def board_cb(client, cq):
-    text, kb, page = render(int(cq.data.split("|")[1]))
+    text, kb, page = render(int(cq.data.split("|")[1]), cq.message.chat.id)
     b = BOARDS.get(cq.message.chat.id)
     if b and b.msg_id == cq.message.id:
         b.page = page

@@ -20,17 +20,18 @@ USER = [
     BotCommand("cancel", "Cancel a job"),
 ]
 ADMIN_EXTRA = [
-    BotCommand("a", "Authorize a user: /a user_id"),
-    BotCommand("ua", "Unauthorize a user: /ua user_id"),
+    BotCommand("a", "Authorize a user, a group or all: /a id"),
+    BotCommand("ua", "Unauthorize a user, a group or all: /ua id"),
     BotCommand("alist", "List authorized users"),
     BotCommand("ualist", "List unauthorized users"),
+    BotCommand("glist", "List authorized groups"),
     BotCommand("broadcast", "Message everyone who started the bot"),
-]
-OWNER_EXTRA = [
     BotCommand("admin", "Make an admin: /admin user_id"),
     BotCommand("unadmin", "Remove an admin: /unadmin user_id"),
     BotCommand("panel", "User control panel"),
     BotCommand("bot_settings", "Global bot settings"),
+    BotCommand("setlog", "Set the log channel: /setlog id"),
+    BotCommand("unsetlog", "Remove the log channel"),
     BotCommand("restart", "Restart the bot"),
 ]
 
@@ -39,8 +40,6 @@ def commands_for(uid):
     cmds = list(USER)
     if db.is_admin(uid):
         cmds += ADMIN_EXTRA
-    if uid == config.OWNER_ID:
-        cmds += OWNER_EXTRA
     return cmds
 
 

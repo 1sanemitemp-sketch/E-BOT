@@ -8,6 +8,7 @@ from pyrogram.types import InlineKeyboardButton as Btn
 from pyrogram.types import InlineKeyboardMarkup as Markup
 
 import config
+import logchannel
 import menu
 from access import set_auth_state
 from client import app
@@ -19,11 +20,11 @@ TITLES = {"all": "All Users", "active": "Active (24h)", "pending": "Pending", "a
           "rejected": "Rejected", "muted": "Muted", "banned": "Banned", "admins": "Admins"}
 
 
-def _is_owner(_, __, u):
-    return bool(u.from_user) and u.from_user.id == config.OWNER_ID
+def _is_staff(_, __, u):
+    return bool(u.from_user) and db.is_admin(u.from_user.id)
 
 
-owner = filters.create(_is_owner)
+owner = filters.create(_is_staff)  # the owner and every admin (the name is kept for the decorators below)
 
 
 def _fmt(ts):
@@ -143,6 +144,8 @@ async def panel_cb(client, cq):
         _, _, action, uid, flt, page = p
         uid = int(uid)
         if uid != config.OWNER_ID:
+            logchannel.event("PanelAction", f"Action: {action}", f"User: {logchannel.who_id(uid)}",
+                             f"By: {logchannel.who(cq.from_user)}")
             if action == "mute":
                 db.set_status(uid, "muted")
             elif action == "ban":

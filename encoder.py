@@ -205,8 +205,16 @@ async def encode(job, src, dst, s, ext, duration, info=None):
 
 
 async def thumbnail(path, out, duration):
+    """A frame from 10% into the video: at most 320x320 (Telegram's limit), full range JPEG, under 200KB."""
     t = int(max(1, (duration or 0) * 0.1))
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", path,
-           "-frames:v", "1", "-vf", "scale=320:-2", out]
-    rc, _ = await run_proc(cmd)
-    return out if rc == 0 and os.path.exists(out) else None
+    vf = ("scale=320:320:force_original_aspect_ratio=decrease:flags=lanczos:out_range=pc,"
+          "format=yuvj420p")
+    for q in ("3", "8", "16"):
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", path,
+               "-frames:v", "1", "-vf", vf, "-q:v", q, out]
+        rc, _ = await run_proc(cmd)
+        if rc != 0 or not os.path.exists(out):
+            return None
+        if os.path.getsize(out) <= 200 * 1024:
+            return out
+    return None

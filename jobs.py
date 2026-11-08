@@ -9,13 +9,16 @@ import uuid
 import zipfile
 
 from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.enums import ChatType
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+import autorename
+import client as botclient
 import config
 import ddl
 import encoder
+import logchannel
 import rclone
-import autorename
 import thumbs
 from store import db
 from utils import (Cancelled, UserError, bar, bot_stats_text, human_size, human_time,
@@ -57,13 +60,20 @@ NO_CONF = ("GDrive is not connected. In a private chat send /rclone and then you
 
 class Job:
     def __init__(self, kind, user, chat_id, link, custom_name, settings,
-                 thumb_url=None, extract=False, zip_out=False, plain=False):
+                 thumb_url=None, extract=False, zip_out=False, plain=False, origin=None, cmd=""):
         self.id = uuid.uuid4().hex[:8]
         self.kind = kind
+        self.cmd = cmd
         self.user_id = user.id
         name = " ".join(x for x in (user.first_name, user.last_name) if x) or str(user.id)
         self.mention = f'<a href="tg://user?id={user.id}">{html.escape(name)}</a>'
-        self.chat_id = chat_id
+        self.task_by = f"@{user.username}" if getattr(user, "username", None) else self.mention
+        self.user_label = logchannel.who(user)
+        self.chat_id = chat_id  # where the files and the result go (the user's PM for a group task)
+        self.origin = origin  # the chat the command was sent in (a group, or the user's PM)
+        self.origin_id = origin.id if origin is not None else chat_id
+        self.from_group = origin is not None and origin.type != ChatType.PRIVATE
+        self.out_bytes = 0
         self.link = link
         self.custom_name = custom_name
         self.settings = settings
@@ -132,6 +142,10 @@ class Job:
             self.speed = inst if not self.speed else self.speed * 0.6 + inst * 0.4
             self._lt, self._ld = now, done
 
+    def add_out(self, size):
+        """Count the bytes that were delivered (shown on the group card and in the log)."""
+        self.out_bytes += int(size or 0)
+
     def cancel(self):
         self.cancelled = True
         if self.proc:
@@ -163,11 +177,7 @@ class Job:
         status = {"queued": "Queued", "resolving": "Resolving", "downloading": "Download",
                   "extracting": "Extract", "encoding": "Encode", "zipping": "Zip", "splitting": "Split",
                   "uploading": "Upload"}.get(self.stage, self.stage)
-        in_mode = "#GDrive" if self.src_gd else "#DDL"
-        if self.kind == "genc":
-            out_mode = "#GDrive"
-        else:
-            out_mode = "#Telegram (Document)" if self.settings["as_doc"] else "#Telegram (Media)"
+        in_mode, out_mode = self.modes()
         files = f"{self.file_idx}/{self.file_total}" if self.file_total else "-"
         index = f"{number}. " if number else ""
         name = html.escape(self.file_name[:90]) or "Preparing..."
@@ -189,6 +199,31 @@ class Job:
     def render(self):
         number = list(JOBS).index(self.id) + 1 if self.id in JOBS else 1
         return f"{self.render_block(number)}\n\n⌬ <b>Bot Stats</b>\n{bot_stats_text()}"
+
+    def modes(self):
+        in_mode = "#GDrive" if self.src_gd else "#DDL"
+        if self.kind == "genc":
+            out_mode = "#GDrive"
+        else:
+            out_mode = "#Telegram (Document)" if self.settings["as_doc"] else "#Telegram (Media)"
+        return in_mode, out_mode
+
+    def group_card(self):
+        """The message a group sees when a task is done: the files went to the user's PM."""
+        in_mode, out_mode = self.modes()
+        title = html.escape((self.dest or self.file_name or "Task")[:100])
+        what = "Result link has" if self.kind == "genc" else "File(s) have"
+        return (
+            f"<b>{title}</b>\n│\n"
+            f"┟ <b>Task Size</b> → {human_size(self.out_bytes)}\n"
+            f"┠ <b>Time Taken</b> → {human_time(time.time() - self.started)}\n"
+            f"┠ <b>In Mode</b> → {in_mode}\n"
+            f"┠ <b>Out Mode</b> → {out_mode}\n"
+            f"┠ <b>Total Files</b> → {self.ok}\n"
+            f"┖ <b>Task By</b> → {self.task_by}\n\n"
+            f"〶 <b>Action Performed :</b>\n"
+            f"⋗ {what} been sent to User PM"
+        )
 
     def result_markup(self):
         """A button with the folder/file link, shown under the completion message."""
@@ -409,6 +444,7 @@ async def send_telegram(client, job, path, name, thumb, info, force_doc=False):
                                 duration=int(info["duration"]), width=info["width"],
                                 height=info["height"], thumb=thumb,
                                 supports_streaming=True, progress=prog)
+    job.add_out(size)
     if job.cancelled:
         raise Cancelled()
 
@@ -434,6 +470,7 @@ async def deliver_file(client, job, ctx, path, thumb, rel_dir=""):
             job.total = os.path.getsize(part)
             dest = "/".join(x for x in (ctx.get("dest_dir"), rel_dir) if x) or None
             await rclone.upload(job, ctx["remote"], part, dest, ctx["parent_id"])
+            job.add_out(job.total)
             ctx.setdefault("uploaded", []).append(name)
         else:
             await send_telegram(client, job, part, name, thumb, None, force_doc=True)
@@ -456,17 +493,19 @@ async def deliver_plain(client, job, ctx, path, rel_dir=""):
 
 async def passthrough(client, job, ctx, src, out_dir, use_custom, rel_dir=""):
     """Upload a file as it is (plain mode, or an archive without -e). Nothing is encoded."""
-    name = os.path.basename(src)
-    if use_custom and job.custom_name:
-        ext = os.path.splitext(name)[1]
-        name = job.custom_name if os.path.splitext(job.custom_name)[1] else job.custom_name + ext
-    elif (job.settings.get("auto_rename") and not is_archive(src)
-          and os.path.splitext(name)[1].lower() in encoder.VIDEO_EXT):
+    name = os.path.basename(src)  # with -n and Auto Rename on, the file was downloaded under the -n name
+    renamed = False
+    if (job.settings.get("auto_rename") and not is_archive(src)
+            and os.path.splitext(name)[1].lower() in encoder.VIDEO_EXT):
         info = await encoder.probe(src)  # Auto Rename also names plain uploads of video files
         if info:
             name = autorename.render(job.settings["auto_rename"], name, info, resolution=f"{info['height']}p",
                                      ext=os.path.splitext(name)[1],
                                      lib=autorename.lib_from("copy", info.get("vcodec")))
+            renamed = True
+    if not renamed and use_custom and job.custom_name:
+        ext = os.path.splitext(name)[1]
+        name = job.custom_name if os.path.splitext(job.custom_name)[1] else job.custom_name + ext
     name = unique_name(job, safe_name(name), rel_dir if job.kind == "genc" else "")
     ensure_dest(job, ctx, "", name)
     if job.zip_out and not is_archive(src):  # -z: collect the file for the zip
@@ -490,7 +529,8 @@ async def encode_one(client, job, ctx, src, out_dir, use_custom):
     if not info or info["duration"] <= 0:
         raise UserError("The video file is invalid or corrupt.")
     label = encoder.quality_label(s, info["height"])
-    custom = job.custom_name if use_custom else None
+    # With Auto Rename on, -n only names the download; the format then builds the output name from it
+    custom = job.custom_name if (use_custom and not s.get("auto_rename")) else None
     out_name, ext = encoder.output_name(src_name, label, s["swap"], s["ext"], custom)
     if s.get("auto_rename") and not custom:
         out_name = autorename.render(
@@ -518,11 +558,16 @@ async def encode_one(client, job, ctx, src, out_dir, use_custom):
         job.set_stage("uploading", "Rclone")
         job.total = os.path.getsize(out_path)
         await rclone.upload(job, ctx["remote"], out_path, ctx.get("dest_dir"), ctx["parent_id"])
+        job.add_out(job.total)
         ctx.setdefault("uploaded", []).append(out_name)
     else:
         out_info = await encoder.probe(out_path) or info
-        thumb = job.thumb or await encoder.thumbnail(
-            out_path, os.path.join(out_dir, "thumb.jpg"), out_info["duration"])
+        # A thumbnail only comes with the file when the user chose one (-t or /settings), or when the
+        # file is sent as a video: a document without a chosen thumbnail gets none.
+        thumb = job.thumb
+        if not thumb and not s["as_doc"]:
+            thumb = await encoder.thumbnail(out_path, os.path.join(out_dir, "thumb.jpg"),
+                                            out_info["duration"])
         await send_telegram(client, job, out_path, out_name, thumb, out_info)
 
 
@@ -584,7 +629,12 @@ async def process_item(client, job, ctx, item, single):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
     use_custom = single and not job.zip_out
-    src = await download_item(job, ctx, item, src_dir)
+    save_as = None
+    if use_custom and job.custom_name and job.settings.get("auto_rename"):
+        save_as = job.custom_name  # Auto Rename reads this name, exactly like WZML-X
+        if not os.path.splitext(save_as)[1] and item.get("name"):
+            save_as += os.path.splitext(item["name"])[1]
+    src = await download_item(job, ctx, item, src_dir, save_as=save_as)
     job.file_name = job.custom_name if (use_custom and job.custom_name) else os.path.basename(src)
     rel_dir = os.path.dirname(item["path"]) if (job.plain and item.get("path")) else ""
     await handle_local(client, job, ctx, src, out_dir, use_custom, rel_dir)
@@ -700,35 +750,99 @@ async def pipeline(client, job):
                 job.user_id, ctx["remote"], target, ctx["parent_id"])
 
 
-async def _finish(client, job, final):
-    """Send the result as a new message so the mention notifies the user."""
+def _open_pm_markup():
+    if not botclient.BOT_USERNAME:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📩 Open PM", url=f"https://t.me/{botclient.BOT_USERNAME}")]])
+
+
+async def _finish(client, job, final, success):
+    """Send the result to the user (PM for a group task). A group only gets a short card."""
+    pm_ok = True
     try:
         await client.send_message(job.chat_id, final, reply_markup=job.result_markup())
     except Exception:
+        pm_ok = False
         log.warning("could not send the final message", exc_info=True)
+    if not job.from_group:
+        return
+    try:
+        if not pm_ok:
+            text = (job.header("⚠️ <b>Task finished, but I could not message you.</b>")
+                    + "\nOpen the bot in PM, press Start, and run the task again.")
+            await client.send_message(job.origin_id, text, reply_markup=_open_pm_markup())
+        elif success:
+            await client.send_message(job.origin_id, job.group_card(), reply_markup=_open_pm_markup())
+        else:
+            await client.send_message(job.origin_id, final)
+    except Exception:
+        log.warning("could not send the group message", exc_info=True)
+
+
+def _log_started(job):
+    flags = " ".join(x for x in ("-e" if job.extract else "", "-z" if job.zip_out else "",
+                                 f"-n {job.custom_name}" if job.custom_name else "",
+                                 "-t" if job.thumb_url else "") if x)
+    logchannel.event(
+        "TaskStarted",
+        f"Task: <code>{job.id}</code> · /{job.cmd or job.kind}",
+        f"User: {job.user_label}",
+        f"Chat: {logchannel.where(job.origin)}",
+        f"Link: <code>{html.escape(job.link[:300])}</code>",
+        f"Flags: <code>{html.escape(flags)}</code>" if flags else "",
+        f"Encode: {job.settings['vcodec']} / CRF {job.settings['crf']} / {job.settings['preset']}"
+        if not job.plain else "Mode: plain upload (no encode)")
+
+
+def _log_finished(job, state, error=""):
+    logchannel.event(
+        f"Task{state}",
+        f"Task: <code>{job.id}</code> · /{job.cmd or job.kind}",
+        f"User: {job.user_label}",
+        f"Chat: {logchannel.where(job.origin)}",
+        f"Name: <code>{html.escape((job.dest or job.file_name or '-')[:150])}</code>",
+        f"Files: {job.ok}/{job.file_total} · Size: {human_size(job.out_bytes)} · "
+        f"Time: {human_time(time.time() - job.started)}",
+        f"Link: {job.dest_link}" if job.dest_link else "",
+        f"Error: <code>{html.escape(error[:400])}</code>" if error else "")
 
 
 async def run_job(client, job):
     import board  # imported here because board itself needs jobs.JOBS
     try:
-        await board.ensure(client, job.chat_id)  # all tasks share one live status message per chat
+        await board.ensure(client, job.origin_id)  # every chat has one live status message
     except Exception:
         log.warning("could not open the status board", exc_info=True)
+    _log_started(job)
     final = job.header("❌ <b>Stopped.</b>")
+    success, state, error = False, "Stopped", ""
     try:
-        async with LIMITER:
+        if db.is_admin(job.user_id):  # admins have no limit: they never wait in the queue
             if job.cancelled:
                 raise Cancelled()
             await pipeline(client, job)
+        else:
+            async with LIMITER:
+                if job.cancelled:
+                    raise Cancelled()
+                await pipeline(client, job)
         final = job.summary()
+        success = job.ok > 0
+        state = "Completed" if not job.failed else "CompletedWithErrors"
+        if job.failed:
+            error = "; ".join(f"{n}: {e}" for n, e in job.failed[:3])
     except (Cancelled, asyncio.CancelledError):
         final = job.header("❌ <b>Cancelled.</b>")
+        state = "Cancelled"
     except UserError as e:
         final = job.header("❌ <b>Failed</b>") + f"\n{html.escape(str(e))}"
+        state, error = "Failed", str(e)
     except Exception as e:
         log.exception("job failed")
         final = job.header("❌ <b>Error</b>") + f"\n<code>{html.escape(str(e)[:500])}</code>"
+        state, error = "Error", str(e)
     finally:
         JOBS.pop(job.id, None)
         shutil.rmtree(job.workdir, ignore_errors=True)
-    await _finish(client, job, final)
+    _log_finished(job, state, error)
+    await _finish(client, job, final, success)

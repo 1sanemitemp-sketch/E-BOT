@@ -6,14 +6,16 @@ import sys
 import time
 
 from pyrogram import StopPropagation, filters
-from pyrogram.enums import ChatType
+from pyrogram.enums import ChatAction, ChatType
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import InlineKeyboardButton as Btn
 from pyrogram.types import InlineKeyboardMarkup as Markup
 
 import autorename
 import board
+import client as botclient
 import config
+import logchannel
 import rclone
 import thumbs
 from access import access_view
@@ -24,7 +26,8 @@ from utils import bot_stats_text, stats
 
 TASKS = set()
 DEFAULT_TAG = DEFAULTS["tag"]
-AWAIT = {}  # user id -> (what we wait for: thumb/tag/rclone, time, id of the triggering message)
+AWAIT = {}  # user id -> (what we wait for: thumb/tag/rename/rclone, time, id of the triggering message,
+            #                 chat id and message id of the settings prompt, so it can be edited back)
 
 OPTIONS = {
     "vcodec": [("libx264", "libx264"), ("libx265", "libx265"), ("libvpx-vp9", "libvpx-vp9"),
@@ -71,23 +74,23 @@ HELP_TEXT = (
 )
 
 ADMIN_HELP = (
-    "\n<b>Admin</b>\n"
+    "\n<b>Admin</b> (the owner and every admin, no limits)\n"
     "/a <code>user_id</code> - authorize a user\n"
-    "/ua <code>user_id</code> - unauthorize a user\n"
-    "/alist - authorized users\n"
-    "/ualist - unauthorized users\n"
+    "/a <code>group_id</code> - authorize a group (or send /a inside the group). Members can use the bot "
+    "in that group only; files and results go to their PM\n"
+    "/a <code>all</code> - authorize everyone who started the bot\n"
+    "/ua <code>user_id | group_id | all</code> - unauthorize (admins always stay admins)\n"
+    "/alist, /ualist, /glist - authorized users, unauthorized users, authorized groups\n"
     "/broadcast <code>text</code> (or /bc) - message everyone who started the bot; "
     "reply to any message, sticker or photo to broadcast that instead\n"
-)
-
-OWNER_HELP = (
-    "\n<b>Owner</b>\n"
-    "/admin <code>user_id</code> - make an admin\n"
-    "/unadmin <code>user_id</code> - remove an admin\n"
+    "/admin <code>user_id</code>, /unadmin <code>user_id</code> - make or remove an admin\n"
     "/panel - user control panel\n"
     "/bot_settings - global bot settings\n"
+    "/setlog <code>channel_id</code>, /unsetlog - log channel (every command, task and setting change)\n"
     "/restart - restart the bot (cancels running tasks)\n"
 )
+
+OWNER_HELP = ""
 
 USAGE = ("Please send a link.\n<code>/genc link</code>\n<code>/tenc link</code>\n"
          "<code>/tenc direct_link -n ANIME.mkv</code>\n"
@@ -114,17 +117,29 @@ async def gate_msg(client, m):
         return
     rec = db.touch(m.from_user)
     uid = m.from_user.id
-    if uid == config.OWNER_ID:
-        return
+    if uid in db.fresh:
+        db.fresh.discard(uid)
+        logchannel.event("NewUser", f"User: {logchannel.who(m.from_user)}", f"Chat: {logchannel.where(m.chat)}")
+    text = (m.text or "").strip()
     private = m.chat.type == ChatType.PRIVATE
+
+    def log_cmd(state):
+        if text.startswith("/"):
+            logchannel.event("Command", f"{state}", f"User: {logchannel.who(m.from_user)}",
+                             f"Chat: {logchannel.where(m.chat)}", f"<code>{html.escape(text[:300])}</code>")
+
+    if uid == config.OWNER_ID:
+        return log_cmd("👑 Owner")
     if rec["status"] == "banned":
+        log_cmd("🚫 Banned user")
         if private:
             await m.reply_text("🚫 You are banned from using this bot.")
         raise StopPropagation
     if rec["status"] == "muted":
+        log_cmd("🔇 Muted user")
         raise StopPropagation
-    if not db.is_authorized(uid):
-        text = (m.text or "").strip()
+    if not db.can_use(uid, m.chat.id, private):
+        log_cmd("⛔ Blocked (not authorized)")
         if text.startswith("/start"):
             return
         if text.startswith("/"):
@@ -134,6 +149,7 @@ async def gate_msg(client, m):
             else:
                 await m.reply_text("You are not authorized. Open the bot in a private chat and send /start.")
         raise StopPropagation
+    log_cmd("✅ Allowed" if db.is_authorized(uid) else "✅ Allowed (authorized group)")
 
 
 @app.on_callback_query(group=-1)
@@ -145,9 +161,22 @@ async def gate_cb(client, cq):
     if rec["status"] in ("banned", "muted"):
         await cq.answer("No access.", show_alert=True)
         raise StopPropagation
-    if not db.is_authorized(uid) and not (cq.data or "").startswith("rq|"):
+    chat = cq.message.chat if cq.message else None
+    private = chat is None or chat.type == ChatType.PRIVATE
+    if not db.can_use(uid, chat.id if chat else 0, private) and not (cq.data or "").startswith("rq|"):
         await cq.answer("You are not authorized to use this bot.", show_alert=True)
         raise StopPropagation
+
+
+@app.on_message(filters.new_chat_members)
+async def added_to_group(client, m):
+    """Tell the log channel when the bot is added to a group."""
+    for u in m.new_chat_members or []:
+        if u.is_self:
+            logchannel.event("BotAddedToGroup", f"Group: {logchannel.where(m.chat)}",
+                             f"By: {logchannel.who(m.from_user)}",
+                             "Authorized: " + ("✅ yes" if db.is_group_authorized(m.chat.id)
+                                              else "❌ no (an admin must send /a in the group)"))
 
 
 # ------------------------------------------------------------------ basic
@@ -155,7 +184,7 @@ async def gate_cb(client, cq):
 async def start_cmd(client, m):
     if not m.from_user:
         return
-    if not db.is_authorized(m.from_user.id):
+    if not db.can_use(m.from_user.id, m.chat.id, m.chat.type == ChatType.PRIVATE):
         text, kb = access_view(db.get_user(m.from_user.id))
         return await m.reply_text(text, reply_markup=kb)
     await m.reply_text(START_TEXT)
@@ -174,8 +203,9 @@ async def help_cmd(client, m):
 
 @app.on_message(filters.command("restart"))
 async def restart_cmd(client, m):
-    if not m.from_user or m.from_user.id != config.OWNER_ID:
+    if not m.from_user or not db.is_admin(m.from_user.id):
         return
+    logchannel.event("Restart", f"By: {logchannel.who(m.from_user)}")
     jobs = list(JOBS.values())
     await m.reply_text(f"🔄 Restarting... cancelling {len(jobs)} running task(s).")
     for j in jobs:
@@ -232,16 +262,30 @@ async def enc_cmd(client, m):
     if not link:
         return await m.reply_text(USAGE)
     uid = m.from_user.id
+    private = m.chat.type == ChatType.PRIVATE
     if (kind == "genc" or rclone.gdrive_id(link)) and not rclone.has_conf(uid):
         return await m.reply_text(NO_CONF)
+    if not private:
+        # in a group the files and the result go to the user's PM, so the bot must be able to write there
+        try:
+            await client.send_chat_action(uid, ChatAction.TYPING)
+        except Exception:
+            kb = None
+            if botclient.BOT_USERNAME:
+                kb = Markup([[Btn("📩 Start the bot in PM", url=f"https://t.me/{botclient.BOT_USERNAME}?start=group")]])
+            return await m.reply_text(
+                "⚠️ I send your files to your PM. Open the bot in PM, press Start, then send the command again.",
+                reply_markup=kb)
     if not db.is_admin(uid):
         if not db.get_bot("accept_tasks"):
             return await m.reply_text("⏸ The bot is not accepting new tasks right now. Please try again later.")
         limit = db.get_bot("user_limit")
         if limit and sum(1 for j in JOBS.values() if j.user_id == uid) >= limit:
             return await m.reply_text(f"You already have {limit} running task(s). Wait for them to finish.")
-    job = Job(kind, m.from_user, m.chat.id, link, opts["name"], db.get_settings(uid),
-              thumb_url=opts["thumb"], extract=opts["extract"], zip_out=opts["zip"], plain=plain)
+    dest_chat = m.chat.id if private else uid  # a group task delivers to the user's PM
+    job = Job(kind, m.from_user, dest_chat, link, opts["name"], db.get_settings(uid),
+              thumb_url=opts["thumb"], extract=opts["extract"], zip_out=opts["zip"], plain=plain,
+              origin=m.chat, cmd=cmd)
     JOBS[job.id] = job
     db.bump_jobs(uid)
     task = asyncio.create_task(run_job(client, job))
@@ -341,7 +385,7 @@ async def rclone_cmd(client, m):
     AWAIT.pop(uid, None)
     doc = m.document or (m.reply_to_message.document if m.reply_to_message else None)
     if not doc:
-        AWAIT[uid] = ("rclone", time.time(), m.id)
+        AWAIT[uid] = ("rclone", time.time(), m.id, m.chat.id, 0)
         return await m.reply_text(GD_HELP + "\n\n📎 <b>Send your rclone.conf file now.</b>")
     data = await _read_conf_document(client, doc, uid)
     if data is None:
@@ -398,7 +442,8 @@ def main_kb(uid):
 def rename_text(uid):
     fmt = db.get_settings(uid)["auto_rename"]
     return ("✏️ <b>Auto Rename</b>\n\nFormat: " + (f"<code>{html.escape(fmt)}</code>" if fmt else "Not set (off)") +
-            "\n\nEvery output file is named from this format. It is not used when you give a name with -n.")
+            "\n\nEvery output file is named from this format. With -n the file is first downloaded under "
+            "your -n name, then this format builds the final name from it.")
 
 
 def rename_kb(uid):
@@ -459,6 +504,10 @@ def opt_kb(uid, key):
     return Markup(rows)
 
 
+CHANGING = {"set", "swap", "asdoc", "autodel", "tagreset", "rnoff", "cfix", "rmthumb", "rmgd",
+            "rsenc_y", "rsall_y"}
+
+
 @app.on_message(filters.command("settings"))
 async def settings_cmd(client, m):
     if not m.from_user:
@@ -481,6 +530,10 @@ async def settings_cb(client, cq):
         return await cq.answer("These are not your settings. Send /settings.", show_alert=True)
     act = p[2]
     AWAIT.pop(uid, None)
+    if act in CHANGING:
+        detail = f"{p[3]} = {p[4]}" if act == "set" and len(p) > 4 else act
+        logchannel.event("SettingsChanged", f"User: {logchannel.who(cq.from_user)}",
+                         f"Change: <code>{html.escape(detail)}</code>")
     back = Markup([[Btn("« Back", callback_data=f"st|{uid}|menu")]])
 
     if act == "close":
@@ -502,7 +555,7 @@ async def settings_cb(client, cq):
         db.set_setting(uid, key, not db.get_settings(uid)[key])
         await _show(cq, main_text(uid), main_kb(uid))
     elif act == "tag":
-        AWAIT[uid] = ("tag", time.time(), 0)
+        AWAIT[uid] = ("tag", time.time(), 0, cq.message.chat.id, cq.message.id)
         cur = db.get_settings(uid)["tag"]
         example = (cur or "[My Tag]") + " NAME S01 720p"
         await _show(cq, "🏷 <b>Tag</b>\n\nCurrent: " + (f"<code>{html.escape(cur)}</code>" if cur else "Not set") +
@@ -516,7 +569,7 @@ async def settings_cb(client, cq):
     elif act == "rn":
         await _show(cq, rename_text(uid), rename_kb(uid))
     elif act == "rnset":
-        AWAIT[uid] = ("rename", time.time(), 0)
+        AWAIT[uid] = ("rename", time.time(), 0, cq.message.chat.id, cq.message.id)
         await _show(cq, "✏️ <b>Set Auto Rename format</b>\n\nSend the format as a message, for example:\n"
                         "<code>{name} {season} - {episode} [{resolution}] [{shortlang}]{extension}</code>\n\n"
                         "Tap VIEW ALL AVAILABLE FORMATS on the previous screen to see every placeholder.",
@@ -532,7 +585,7 @@ async def settings_cb(client, cq):
         db.set_setting(uid, "colorfix", not db.get_settings(uid)["colorfix"])
         await _show(cq, enc_text(uid), enc_kb(uid))
     elif act == "thumb":
-        AWAIT[uid] = ("thumb", time.time(), 0)
+        AWAIT[uid] = ("thumb", time.time(), 0, cq.message.chat.id, cq.message.id)
         await _show(cq, "🖼 <b>Set Thumbnail</b>\n\nSend a photo, an image file, or a direct image link "
                         "within 2 minutes.", back)
     elif act == "rmthumb":
@@ -545,7 +598,7 @@ async def settings_cb(client, cq):
     elif act == "rcw":
         if cq.message.chat.type != ChatType.PRIVATE:
             return await cq.answer("Open the bot in a private chat to send your config.", show_alert=True)
-        AWAIT[uid] = ("rclone", time.time(), 0)
+        AWAIT[uid] = ("rclone", time.time(), 0, cq.message.chat.id, cq.message.id)
         await _show(cq, "📎 <b>Send your rclone.conf file now.</b>\nNo caption is needed.", back)
     elif act == "rmgd":
         rclone.remove_conf(uid)
@@ -573,15 +626,37 @@ async def settings_cb(client, cq):
     await cq.answer()
 
 
+async def _back_to_settings(client, m, uid, entry, kind):
+    """Delete the user's message and turn the prompt back into the settings screen,
+    so nothing extra is written to the chat (like the encode settings buttons)."""
+    chat_id, prompt_id = entry[3], entry[4]
+    try:
+        await m.delete()
+    except Exception:
+        pass  # a bot can only delete messages in a group when it is an admin there
+    text, kb = (rename_text(uid), rename_kb(uid)) if kind == "rename" else (main_text(uid), main_kb(uid))
+    try:
+        if not prompt_id:
+            raise ValueError
+        await client.edit_message_text(chat_id, prompt_id, text, reply_markup=kb)
+    except MessageNotModified:
+        pass
+    except Exception:
+        await client.send_message(chat_id, text, reply_markup=kb)
+
+
 @app.on_message(filters.photo | filters.document | filters.text, group=1)
 async def await_input(client, m):
     """Receives the next message after a prompt (thumbnail, tag, rename format or rclone.conf)."""
     if not m.from_user or m.from_user.id not in AWAIT:
         return
     uid = m.from_user.id
-    kind, started, trigger = AWAIT[uid]
+    entry = AWAIT[uid]
+    kind, started, trigger = entry[0], entry[1], entry[2]
     if m.id == trigger:
         return  # the command message that opened the prompt
+    if entry[3] and m.chat.id != entry[3]:
+        return  # the answer must come in the chat where the prompt was shown
     if time.time() - started > 300 or (kind != "rclone" and time.time() - started > 120):
         AWAIT.pop(uid, None)
         return
@@ -596,7 +671,9 @@ async def await_input(client, m):
             return await m.reply_text("Please send the tag as text.")
         db.set_setting(uid, "tag", tag)
         AWAIT.pop(uid, None)
-        return await m.reply_text(f"✅ Tag set to <code>{html.escape(tag)}</code>.")
+        logchannel.event("SettingsChanged", f"User: {logchannel.who(m.from_user)}",
+                         f"Tag: <code>{html.escape(tag)}</code>")
+        return await _back_to_settings(client, m, uid, entry, "tag")
 
     if kind == "rename":
         ok, result = autorename.validate_format(text)
@@ -604,10 +681,9 @@ async def await_input(client, m):
             return await m.reply_text(f"❌ {html.escape(result)}")
         db.set_setting(uid, "auto_rename", result)
         AWAIT.pop(uid, None)
-        return await m.reply_text(
-            f"✅ Auto Rename format saved:\n<code>{html.escape(result)}</code>\n\n"
-            f"Example: <code>{html.escape(autorename.EXAMPLE_FILE)}</code>\n→ "
-            f"<code>{html.escape(autorename.preview(result))}</code>")
+        logchannel.event("SettingsChanged", f"User: {logchannel.who(m.from_user)}",
+                         f"Auto Rename: <code>{html.escape(result)}</code>")
+        return await _back_to_settings(client, m, uid, entry, "rename")
 
     if kind == "rclone":
         data = None
@@ -618,6 +694,7 @@ async def await_input(client, m):
         if not data:
             return await m.reply_text("Please send the rclone.conf file (or paste its text).")
         AWAIT.pop(uid, None)
+        logchannel.event("GDriveConnected", f"User: {logchannel.who(m.from_user)}")
         return await _save_rclone(client, m, data)
 
     # thumbnail
@@ -642,4 +719,5 @@ async def await_input(client, m):
     if not ok:
         return await m.reply_text("❌ Could not use that image. Try another one.")
     AWAIT.pop(uid, None)
-    await m.reply_text("✅ Thumbnail saved. It will be used for your Telegram uploads.")
+    logchannel.event("SettingsChanged", f"User: {logchannel.who(m.from_user)}", "Thumbnail: set")
+    await _back_to_settings(client, m, uid, entry, "thumb")

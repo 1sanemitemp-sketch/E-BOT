@@ -12,6 +12,8 @@ API_ID = _int("API_ID")
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = _int("OWNER_ID")
+# optional: log channel id (-100...). It can also be set from the bot with /setlog
+LOG_CHANNEL = _int("LOG_CHANNEL")
 
 MAX_CONCURRENT = max(1, _int("MAX_CONCURRENT", 1))
 STATUS_INTERVAL = max(3, _int("STATUS_INTERVAL", 5))
@@ -26,7 +28,6 @@ except Exception:
     os.makedirs(DATA_DIR, exist_ok=True)
 
 RCLONE_DIR = os.path.join(DATA_DIR, "rclone")
-THUMB_DIR = os.path.join(DATA_DIR, "thumbs")
 ADMIN_CONTACTS = os.getenv("ADMIN_CONTACTS", "@sanemi111 @abbacalling420")
 THUMB_DIR = os.path.join(DATA_DIR, "thumbs")
 APPROVAL_CONTACTS = [x.strip() for x in os.getenv("APPROVAL_CONTACTS", "@sanemi111,@abbacalling420").split(",") if x.strip()]

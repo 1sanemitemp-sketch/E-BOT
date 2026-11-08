@@ -5,6 +5,7 @@ from pyrogram.types import InlineKeyboardMarkup as Markup
 
 import config
 import jobs
+import logchannel
 from client import app
 from store import db
 
@@ -25,11 +26,11 @@ TOGGLES = {
 }
 
 
-def _is_owner(_, __, u):
-    return bool(u.from_user) and u.from_user.id == config.OWNER_ID
+def _is_staff(_, __, u):
+    return bool(u.from_user) and db.is_admin(u.from_user.id)
 
 
-owner = filters.create(_is_owner)
+owner = filters.create(_is_staff)  # the owner and every admin (the name is kept for the decorators below)
 
 
 def _on(v):
@@ -44,7 +45,9 @@ def main_view():
         f"Tasks per user: <b>{user_limit}</b>\n"
         f"Approval required: <b>{_on(db.get_bot('approval_required'))}</b>\n"
         f"Split zips above 2GB for GDrive: <b>{_on(db.get_bot('split_gdrive'))}</b>\n"
-        f"Accept new tasks: <b>{_on(db.get_bot('accept_tasks'))}</b>"
+        f"Accept new tasks: <b>{_on(db.get_bot('accept_tasks'))}</b>\n"
+        f"Log channel: <b>{('<code>' + str(db.log_chat()) + '</code>') if db.log_chat() else 'Not set'}</b>"
+        " (/setlog id, /unsetlog)"
     )
     rows = [
         [Btn(f"⚙️ Max tasks at once: {max_tasks}", callback_data="bs|opt|max_concurrent")],
@@ -94,3 +97,29 @@ async def bot_settings_cb(client, cq):
     except MessageNotModified:
         pass
     await cq.answer()
+
+
+@app.on_message(filters.command("setlog") & owner)
+async def setlog_cmd(client, m):
+    arg = m.command[1] if len(m.command) > 1 else ""
+    if not arg.lstrip("-").isdigit():
+        cur = db.log_chat()
+        return await m.reply_text(
+            "Usage: <code>/setlog -100xxxxxxxxxx</code>\n"
+            "Make the bot an admin of the channel first (it must be able to post messages).\n"
+            f"Current: {('<code>' + str(cur) + '</code>') if cur else 'Not set'}")
+    chat = int(arg)
+    ok, err = await logchannel.test(client, chat)
+    if not ok:
+        return await m.reply_text("❌ I could not write to that chat. Add the bot as an admin there and try again.\n"
+                                  f"<code>{err[:300]}</code>")
+    db.set_bot("log_chat", chat)
+    await m.reply_text(f"✅ Log channel saved: <code>{chat}</code>")
+
+
+@app.on_message(filters.command("unsetlog") & owner)
+async def unsetlog_cmd(client, m):
+    db.set_bot("log_chat", 0)
+    left = config.LOG_CHANNEL
+    await m.reply_text("🗑 Log channel removed from the bot settings."
+                       + (f" The LOG_CHANNEL variable (<code>{left}</code>) is still used." if left else ""))

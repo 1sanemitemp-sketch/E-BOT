@@ -167,7 +167,8 @@ async def download_path(job, remote, root_id, rel_path, dst, total):
     cb, errs = _make_cb(job)
     args = ["copyto", f"{remote}:{rel_path}", dst, "--drive-root-folder-id", root_id,
             "--drive-acknowledge-abuse", "--multi-thread-streams", "8",
-            "--multi-thread-cutoff", "32M", *STATS_FLAGS]
+            "--multi-thread-cutoff", "32M", "--buffer-size", "64M",
+            "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200", *STATS_FLAGS]
     await _run(job, args, on_err=cb, errs=errs)
 
 
@@ -181,7 +182,8 @@ async def upload(job, remote, local, dest_dir, parent_id):
     cb, errs = _make_cb(job)
     target = f"{remote}:{dest_dir}/{name}" if dest_dir else f"{remote}:{name}"
     args = ["copyto", local, target, *STATS_FLAGS,
-            "--drive-chunk-size", "64M"]
+            "--drive-chunk-size", "128M", "--buffer-size", "64M",
+            "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200"]
     if parent_id:
         args += ["--drive-root-folder-id", parent_id]
     await _run(job, args, on_err=cb, errs=errs)

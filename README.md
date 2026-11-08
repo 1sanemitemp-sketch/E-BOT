@@ -9,6 +9,8 @@ the result to GDrive (`/genc`) or Telegram (`/tenc`).
 | `API_ID`, `API_HASH` | my.telegram.org -> API development tools |
 | `BOT_TOKEN` | @BotFather |
 | `OWNER_ID` | your Telegram user id (@userinfobot) |
+| `LOG_CHANNEL` (optional) | log channel id (`-100...`); can also be set from the bot with `/setlog` |
+| `TG_TRANSMISSIONS` (optional) | parallel Telegram upload/download chunks, default `20` (faster uploads) |
 | `ADMIN_CONTACTS` (optional) | shown to unapproved users, default `@sanemi111 @abbacalling420` |
 
 Everything else (tag, audio bitrate, max concurrent tasks, ...) is changed from the bot itself.
@@ -36,7 +38,34 @@ Settings, the users list and rclone.conf files are stored in `/data` and survive
 
 ## Access control
 New users must be approved. They get their ID and a "Request Approval" button; requests reach the owner and the admins.
-- Admins and owner: `/a user_id`, `/ua user_id`, `/alist`, `/ualist`, `/broadcast` (or `/bc`): text, or reply to any message to broadcast it
-- Owner only: `/admin user_id`, `/unadmin user_id`, `/panel`, `/bot_settings`, `/restart`
+
+**Admins have the same power as the owner** (no limits, no queue): `/a`, `/ua`, `/alist`, `/ualist`, `/glist`, `/broadcast` (or `/bc`),
+`/admin`, `/unadmin`, `/panel`, `/bot_settings`, `/setlog`, `/unsetlog`, `/restart`. The owner can never be removed.
+
+- `/a user_id` / `/ua user_id` - authorize / unauthorize a user
+- `/a all` - authorize everyone who started the bot (muted users are unmuted; banned users and admins are unchanged)
+- `/ua all` - unauthorize everyone; the owner and the admins always stay
+- `/a group_id` (or just `/a` inside the group) - authorize a group. `/ua group_id` removes it. `/glist` lists the groups.
+
+### Groups
+Make the bot an **admin** of the group (so it can read replies and delete the messages that set a tag or a format), then send `/a` in it.
+Every member can then use the bot **in that group only** (not in PM, unless they are authorized themselves):
+- `/status` in the group shows only the tasks that were started in that group
+- files and results go to the user's PM (the user must have pressed Start once), the group gets a short card:
+  `File(s) have been sent to User PM`
+
+## Log channel
+Create a channel, add the bot as an admin, then send `/setlog -100xxxxxxxxxx` (or set `LOG_CHANNEL` on Railway).
+It receives: new users, every command (also from blocked users), task start / finish / failure / cancel with link, size and time,
+approval requests, authorize / unauthorize (also all and groups), admin changes, panel actions, setting changes, GDrive connects,
+groups the bot is added to, restarts.
+
+## Auto Rename and -n
+With Auto Rename on, `-n Name.mkv` first names the download, then the Auto Rename format builds the final name from it
+(the same as `-e -n Pack.zip`: the archive gets the -n name, every video inside is renamed by the format).
+
+## Thumbnails
+`-t link` or a thumbnail set in /settings is used for every upload. Without one, a video (Media) gets a frame of the video and a
+Document gets no thumbnail.
 
 The bot registers its own command menu on startup, nothing to set in BotFather.

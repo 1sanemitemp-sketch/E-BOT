@@ -1,11 +1,14 @@
 import html
+import re
 
 from pyrogram import filters
+from pyrogram.enums import ChatType
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import InlineKeyboardButton as Btn
 from pyrogram.types import InlineKeyboardMarkup as Markup
 
 import config
+import logchannel
 import menu
 from client import app
 from store import db
@@ -50,6 +53,7 @@ def request_kb(uid):
 async def set_auth_state(client, uid, state):
     """Authorize ('approved') or unauthorize ('rejected') a user and tell them."""
     db.set_auth(uid, state)
+    logchannel.event("Authorized" if state == "approved" else "Unauthorized", f"User: {logchannel.who_id(uid)}")
     text = ("✅ You have been approved. Send /help to see what I can do."
             if state == "approved" else
             "❌ Your access request was declined, or your access was removed.")
@@ -72,6 +76,7 @@ async def request_cb(client, cq):
     if auth == "new":
         db.set_auth(uid, "pending")
         rec = db.get_user(uid)
+        logchannel.event("ApprovalRequest", f"User: {logchannel.who(cq.from_user)}")
         for rid in db.admin_ids():
             try:
                 await client.send_message(rid, request_text(rec), reply_markup=request_kb(uid))
@@ -111,35 +116,88 @@ async def approval_cb(client, cq):
 
 
 def _ids(m):
-    return [int(x) for x in m.command[1:] if x.isdigit()]
+    """User ids and group ids (group ids are negative) given after the command."""
+    return [int(x) for x in m.command[1:] if re.fullmatch(r"-?\d+", x)]
+
+
+def _is_all(m):
+    return len(m.command) > 1 and m.command[1].lower() == "all"
 
 
 def _is_admin_msg(m):
     return bool(m.from_user) and db.is_admin(m.from_user.id)
 
 
+async def _group_title(client, chat_id):
+    try:
+        chat = await client.get_chat(chat_id)
+        return chat.title or str(chat_id)
+    except Exception:
+        return str(chat_id)
+
+
+async def _set_group(client, m, chat_id, flag):
+    title = await _group_title(client, chat_id)
+    db.set_group(chat_id, title, flag, by=m.from_user.id)
+    logchannel.event("GroupAuthorized" if flag else "GroupUnauthorized",
+                     f"Group: {html.escape(title)} [<code>{chat_id}</code>]",
+                     f"By: {logchannel.who(m.from_user)}")
+    if flag:
+        await m.reply_text(
+            f"✅ Group authorized: <b>{html.escape(title)}</b> (<code>{chat_id}</code>)\n"
+            "Every member can use the bot in this group. Files and results are sent to the user's PM. "
+            "The bot does not work in PM for members who are not authorized themselves.")
+    else:
+        await m.reply_text(f"🚫 Group unauthorized: <b>{html.escape(title)}</b> (<code>{chat_id}</code>)")
+
+
+A_USAGE = ("Usage:\n<code>/a user_id</code>\n<code>/a group_id</code> (or just /a inside the group)\n"
+           "<code>/a all</code> - authorize everyone who started the bot")
+UA_USAGE = ("Usage:\n<code>/ua user_id</code>\n<code>/ua group_id</code> (or just /ua inside the group)\n"
+            "<code>/ua all</code> - unauthorize everyone (admins stay admins)")
+
+
 @app.on_message(filters.command("a"))
 async def authorize_cmd(client, m):
     if not _is_admin_msg(m):
         return
+    if _is_all(m):
+        n = db.authorize_all()
+        logchannel.event("AuthorizeAll", f"By: {logchannel.who(m.from_user)}", f"Users changed: {n}")
+        return await m.reply_text(f"✅ Everyone who started the bot is authorized now ({n} changed). "
+                                  "Muted users were unmuted, banned users and admins are unchanged.")
     ids = _ids(m)
     if not ids:
-        return await m.reply_text("Usage: <code>/a user_id</code>")
-    for uid in ids:
+        if m.chat.type != ChatType.PRIVATE and len(m.command) == 1:
+            return await _set_group(client, m, m.chat.id, True)
+        return await m.reply_text(A_USAGE)
+    users = [i for i in ids if i > 0]
+    for gid in [i for i in ids if i < 0]:
+        await _set_group(client, m, gid, True)
+    for uid in users:
         db.ensure_user(uid)
         await set_auth_state(client, uid, "approved")
-    await m.reply_text("✅ Authorized: " + ", ".join(f"<code>{i}</code>" for i in ids))
+    if users:
+        await m.reply_text("✅ Authorized: " + ", ".join(f"<code>{i}</code>" for i in users))
 
 
 @app.on_message(filters.command("ua"))
 async def unauthorize_cmd(client, m):
     if not _is_admin_msg(m):
         return
+    if _is_all(m):
+        n = db.unauthorize_all()
+        logchannel.event("UnauthorizeAll", f"By: {logchannel.who(m.from_user)}", f"Users changed: {n}")
+        return await m.reply_text(f"🚫 Everyone is unauthorized now ({n} changed). The owner and the admins keep their access.")
     ids = _ids(m)
     if not ids:
-        return await m.reply_text("Usage: <code>/ua user_id</code>")
+        if m.chat.type != ChatType.PRIVATE and len(m.command) == 1:
+            return await _set_group(client, m, m.chat.id, False)
+        return await m.reply_text(UA_USAGE)
     done = []
-    for uid in ids:
+    for gid in [i for i in ids if i < 0]:
+        await _set_group(client, m, gid, False)
+    for uid in [i for i in ids if i > 0]:
         if db.is_admin(uid):
             await m.reply_text(f"<code>{uid}</code> is an admin or the owner. Use /unadmin first.")
             continue
@@ -148,6 +206,17 @@ async def unauthorize_cmd(client, m):
         done.append(uid)
     if done:
         await m.reply_text("🚫 Unauthorized: " + ", ".join(f"<code>{i}</code>" for i in done))
+
+
+@app.on_message(filters.command("glist"))
+async def glist_cmd(client, m):
+    if not _is_admin_msg(m):
+        return
+    groups = db.list_groups()
+    if not groups:
+        return await m.reply_text("👥 <b>Authorized groups</b>\n\nNo groups.")
+    lines = [f"{i}. {html.escape(g['title'])} — <code>{g['id']}</code>" for i, g in enumerate(groups, 1)]
+    await m.reply_text(f"👥 <b>Authorized groups</b> ({len(groups)})\n\n" + "\n".join(lines))
 
 
 async def _send_list(m, title, users):
@@ -187,13 +256,14 @@ async def ualist_cmd(client, m):
 
 @app.on_message(filters.command("admin"))
 async def admin_cmd(client, m):
-    if not m.from_user or m.from_user.id != config.OWNER_ID:
+    if not _is_admin_msg(m):
         return
-    ids = _ids(m)
+    ids = [i for i in _ids(m) if i > 0]
     if not ids:
         return await m.reply_text("Usage: <code>/admin user_id</code>")
     for uid in ids:
         db.set_admin(uid, True)
+        logchannel.event("AdminAdded", f"User: {logchannel.who_id(uid)}", f"By: {logchannel.who(m.from_user)}")
         await menu.apply_menu(client, uid)
         try:
             await client.send_message(uid, "⭐ You are now an admin of this bot. Send /help to see your commands.")
@@ -204,12 +274,13 @@ async def admin_cmd(client, m):
 
 @app.on_message(filters.command("unadmin"))
 async def unadmin_cmd(client, m):
-    if not m.from_user or m.from_user.id != config.OWNER_ID:
+    if not _is_admin_msg(m):
         return
-    ids = [i for i in _ids(m) if i != config.OWNER_ID]
+    ids = [i for i in _ids(m) if i > 0 and i != config.OWNER_ID]
     if not ids:
         return await m.reply_text("Usage: <code>/unadmin user_id</code>")
     for uid in ids:
         db.set_admin(uid, False)
+        logchannel.event("AdminRemoved", f"User: {logchannel.who_id(uid)}", f"By: {logchannel.who(m.from_user)}")
         await menu.apply_menu(client, uid)
     await m.reply_text("Admin removed: " + ", ".join(f"<code>{i}</code>" for i in ids))

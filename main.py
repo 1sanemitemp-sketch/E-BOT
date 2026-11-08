@@ -13,11 +13,13 @@ asyncio.set_event_loop(loop)
 
 from pyrogram import idle  # noqa: E402
 
+import client as client_mod  # noqa: E402
 from client import app  # noqa: E402
 import handlers  # noqa: E402,F401  (registers handlers)
 import access  # noqa: E402,F401
 import botsettings  # noqa: E402,F401
 import broadcast  # noqa: E402,F401
+import logchannel  # noqa: E402
 import menu  # noqa: E402
 import panel  # noqa: E402,F401
 
@@ -29,11 +31,14 @@ async def main():
     os.makedirs(config.WORK_DIR, exist_ok=True)
 
     await app.start()
+    me = await app.get_me()
+    client_mod.BOT_USERNAME = me.username or ""
     await menu.apply_all(app)
     try:
         await app.send_message(config.OWNER_ID, "✅ Bot started.")
     except Exception as e:
         log.warning("Owner notification skipped (the owner must send /start to the bot once): %s", e)
+    logchannel.event("BotStarted", "✅ The bot is online.")
     log.info("Bot is running.")
     await idle()
     await app.stop()

@@ -28,6 +28,7 @@ BOT_DEFAULTS = {
     "approval_required": True,
     "split_gdrive": False,      # also split files above 2GB into parts for GDrive (off: one big file)
     "accept_tasks": True,
+    "log_chat": 0,              # log channel id, 0 = use the LOG_CHANNEL variable (or none)
 }
 
 ENCODE_KEYS = ("vcodec", "acodec", "abitrate", "crf", "preset", "res", "fps", "ext", "colorfix")
@@ -49,6 +50,8 @@ class Store:
         self.data.setdefault("users", {})
         self.data.setdefault("settings", {})
         self.data.setdefault("bot", {})
+        self.data.setdefault("groups", {})
+        self.fresh = set()  # users seen for the first time (the log channel is told once)
 
     def save(self):
         with self._lock:
@@ -72,6 +75,7 @@ class Store:
         if rec is None:
             rec = self._new_record(user.id, name, uname, now)
             self.data["users"][uid] = rec
+            self.fresh.add(user.id)
             self.save()
             return rec
         changed = rec.get("name") != name or rec.get("username") != uname
@@ -137,6 +141,61 @@ class Store:
             return True
         rec = self.get_user(uid)
         return bool(rec and self.auth_of(rec) == "approved")
+
+    # ---------- groups ----------
+    def is_group_authorized(self, chat_id):
+        return str(chat_id) in self.data["groups"]
+
+    def set_group(self, chat_id, title="", flag=True, by=0):
+        key = str(chat_id)
+        if flag:
+            self.data["groups"][key] = {"id": chat_id, "title": title or key,
+                                        "since": time.time(), "by": by}
+        else:
+            self.data["groups"].pop(key, None)
+        self.save()
+
+    def list_groups(self):
+        return sorted(self.data["groups"].values(), key=lambda g: g.get("since", 0))
+
+    def can_use(self, uid, chat_id, private):
+        """A user may use the bot when authorized, or inside a group that was authorized."""
+        return self.is_authorized(uid) or (not private and self.is_group_authorized(chat_id))
+
+    # ---------- bulk authorization ----------
+    def authorize_all(self):
+        """Approve every user who started the bot (admins are untouched, banned users stay banned)
+        and unmute the muted ones. Returns how many users changed."""
+        n = 0
+        for rec in self.data["users"].values():
+            if rec["id"] == config.OWNER_ID or rec.get("admin") or rec.get("status") == "banned":
+                continue
+            if rec.get("last_seen", 0) <= 0:
+                continue
+            if self.auth_of(rec) != "approved" or rec.get("status") == "muted":
+                rec["auth"] = "approved"
+                rec["auth_time"] = time.time()
+                if rec.get("status") == "muted":
+                    rec["status"] = "active"
+                n += 1
+        self.save()
+        return n
+
+    def unauthorize_all(self):
+        """Unauthorize every user except the owner and the admins. Returns how many changed."""
+        n = 0
+        for rec in self.data["users"].values():
+            if rec["id"] == config.OWNER_ID or rec.get("admin"):
+                continue
+            if self.auth_of(rec) != "rejected":
+                rec["auth"] = "rejected"
+                rec["auth_time"] = time.time()
+                n += 1
+        self.save()
+        return n
+
+    def log_chat(self):
+        return self.get_bot("log_chat") or config.LOG_CHANNEL
 
     def admin_ids(self):
         ids = {config.OWNER_ID}
